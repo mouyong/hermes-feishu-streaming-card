@@ -3503,6 +3503,11 @@ def _render_queued_complete_hook_block(indent: str, newline: str):
         f"{deeper_indent}    \"source\": _hfc_source,{newline}",
         f"{deeper_indent}    \"message_id\": _hfc_message_id,{newline}",
         f"{deeper_indent}    \"answer\": first_response,{newline}",
+        # Without the turn result this completed event carries no turn_outcome, so the sidecar
+        # takes its success branch: the answer that already streamed to the user gets archived
+        # into the reasoning panel and the raw provider error is left as the card body. Passing
+        # the result through lets the sidecar render the interrupted turn correctly instead.
+        f"{deeper_indent}    \"agent_result\": result if isinstance(result, dict) else {{}},{newline}",
         f"{deeper_indent}    \"duration\": result.get(\"duration\", 0.0) if isinstance(result, dict) else 0.0,{newline}",
         f"{deeper_indent}    \"model\": result.get(\"model\", \"\") if isinstance(result, dict) else \"\",{newline}",
         f"{deeper_indent}    \"tokens\": {{{newline}",
