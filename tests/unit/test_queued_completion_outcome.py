@@ -20,15 +20,20 @@ CONV_ID = "omt_topic"
 MSG_ID = "om_old"
 
 
-def _run_block(block: str, *, first_response: str, result: dict):
-    """Execute the generated block inside a host shaped like the upstream call site."""
+def _run_block(monkeypatch, block: str, *, first_response: str, result: dict):
+    """Execute the generated block inside a host shaped like the upstream call site.
+
+    The emit override goes through monkeypatch, not a bare assignment: a module attribute left
+    patched here would be inherited by every later test file in the same pytest process, and
+    their own overrides would then never run.
+    """
     seen = []
 
     async def emit(local_vars, *, event_name):
         seen.append(hook_runtime.build_event(event_name, local_vars))
         return True
 
-    hook_runtime.emit_from_hermes_locals_async = emit
+    monkeypatch.setattr(hook_runtime, "emit_from_hermes_locals_async", emit)
     source = SimpleNamespace(
         platform="feishu", chat_id=CHAT_ID, thread_id=CONV_ID, _hfc_turn_id=MSG_ID
     )
@@ -74,7 +79,7 @@ def test_queued_completion_reports_the_failed_outcome(monkeypatch):
     """A failed turn must be announced as failed, not inferred from the presence of text."""
     block = "".join(patcher._render_queued_complete_hook_block("    ", "\n"))
     event = _run_block(
-        block,
+        monkeypatch, block,
         first_response="HTTP 403: 预扣费额度失败",
         result={"failed": True, "final_response": "HTTP 403: 预扣费额度失败",
                 "duration": 12.5, "model": "deepseek-flash",
@@ -88,7 +93,7 @@ def test_queued_completion_keeps_the_answer_the_user_was_reading(monkeypatch):
     """The failure must be appended to the streamed answer, and the answer must not be archived."""
     block = "".join(patcher._render_queued_complete_hook_block("    ", "\n"))
     event = _run_block(
-        block,
+        monkeypatch, block,
         first_response="HTTP 403: 预扣费额度失败",
         result={"failed": True, "final_response": "HTTP 403: 预扣费额度失败",
                 "duration": 12.5, "model": "deepseek-flash",
@@ -105,7 +110,7 @@ def test_queued_completion_leaves_a_successful_turn_alone(monkeypatch):
     """Guard against over-reaching: a successful turn gains no outcome and keeps its answer."""
     block = "".join(patcher._render_queued_complete_hook_block("    ", "\n"))
     event = _run_block(
-        block,
+        monkeypatch, block,
         first_response="正常回答",
         result={"duration": 1.0, "model": "deepseek-flash", "input_tokens": 1,
                 "output_tokens": 2, "last_prompt_tokens": 3, "context_length": 9},
@@ -125,7 +130,7 @@ def test_queued_completion_passes_the_result_it_was_given(monkeypatch):
         captured["agent_result"] = local_vars.get("agent_result")
         return True
 
-    hook_runtime.emit_from_hermes_locals_async = emit
+    monkeypatch.setattr(hook_runtime, "emit_from_hermes_locals_async", emit)
     source = SimpleNamespace(
         platform="feishu", chat_id=CHAT_ID, thread_id=CONV_ID, _hfc_turn_id=MSG_ID
     )
