@@ -10524,14 +10524,9 @@ async def test_signed_sensitive_route_uses_raw_encoded_path_for_proof():
     assert body == {"ok": True, "summary": "encoded path"}
 
 
-async def test_zero_timeout_approval_reissues_on_a_late_choice_without_consenting(client):
-    """A late choice on an expired approval leads back to a usable approval, and decides nothing.
+async def test_zero_timeout_approval_explains_expiry_without_reissuing_or_consenting(client):
+    """An expired non-pausable request stays expired and explains how to retry."""
 
-    Contract change: this used to answer 409 and leave the expired card repainted in place — a
-    dead end, since that card could never take a decision again. Reissuing replaces "your click
-    did nothing" with a card the user can actually act on. The security half is unchanged: the
-    late choice is still NOT consent (``choice`` stays empty) and the withdrawn option is dead.
-    """
     test_client, feishu_client = client
     await test_client.post("/events", json=event_payload("message.started", 0))
     requested = await test_client.post(
@@ -10570,17 +10565,11 @@ async def test_zero_timeout_approval_reissues_on_a_late_choice_without_consentin
     result = await test_client.get("/interactions/approval-expired")
     result_body = await result.json()
 
-    assert callback.status == 200
-    assert "重新审批" in callback_body["toast"]["content"]
-    # Consent was NOT taken from the expired card — the only thing that matters for security.
-    assert interaction.choice == ""
-    assert result_body["choice"] == ""
-    # The dead card is withdrawn and a fresh usable one posted, so the user can act again.
-    # (This approval's configured window is 0s, so the renewed card expires again immediately;
-    # what this asserts is that a replacement with live buttons is what the user gets.)
-    await _wait_until(lambda: len(feishu_client.sent) == cards_before + 1)
-    assert interaction_buttons(feishu_client.sent[-1][1])
-    assert action_value["token"] not in str(feishu_client.sent[-1][1])
+    assert callback.status == 409
+    assert "重新发送原请求" in callback_body["toast"]["content"]
+    assert interaction.choice == "" and result_body["choice"] == ""
+    assert len(feishu_client.sent) == cards_before
+    assert not interaction_buttons(callback_body['card'])
     assert (await test_client.post(
         "/card/actions",
         json={
@@ -13321,15 +13310,14 @@ async def test_resume_refreshes_in_place_when_the_dead_card_cannot_be_recalled(c
         'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
         'action': {'value': resume},
     }})
-    assert response.status == 200
-    await _wait_until(
-        lambda: len(cards_edited_into(feishu_client, dead_card_id)) > edits_before
-    )
+    assert response.status == 409
+    body = await response.json()
+    assert '重新发送原请求' in body['toast']['content']
+    assert not interaction_buttons(body['card'])
     assert feishu_client.deleted == []
     assert len(feishu_client.sent) == cards_before
     assert interaction.feishu_message_id == dead_card_id
-    assert interaction.status == 'pending'
-    assert interaction_buttons(cards_edited_into(feishu_client, dead_card_id)[-1])
+    assert interaction.status == 'failed'
 
 
 async def test_any_option_on_an_expired_approval_reissues_it_instead_of_a_dead_button(client):
@@ -13350,6 +13338,7 @@ async def test_any_option_on_an_expired_approval_reissues_it_instead_of_a_dead_b
     expired_option = interaction_buttons(feishu_client.sent[-1][1])[0]['value']
     dead_card_id = interaction.feishu_message_id
     cards_before = len(feishu_client.sent)
+    interaction.last_waiter_poll_at = time.time()
     interaction.requested_at -= 301  # the card is still on screen, its window is not
 
     async def click(value):
@@ -13364,17 +13353,14 @@ async def test_any_option_on_an_expired_approval_reissues_it_instead_of_a_dead_b
     assert interaction.status == 'pending' and interaction.choice == ''
     # Renewal is not consent: the withdrawn card's option decides nothing on replay.
     assert (await click(expired_option)).status == 404
-    # The dead card is withdrawn and replaced, so exactly one usable approval stays in the chat.
-    await _wait_until(lambda: len(feishu_client.sent) == cards_before + 1)
-    assert dead_card_id in feishu_client.deleted
-    assert interaction.feishu_message_id not in {'', dead_card_id}
+    assert len(feishu_client.sent) == cards_before
+    assert feishu_client.deleted == []
+    assert interaction.feishu_message_id == dead_card_id
 
 
-async def test_expired_approval_without_the_pause_marker_also_reissues(client):
-    """An approval that expired straight to "failed" (no pause marker) reissues the same way.
+async def test_expired_approval_without_pause_requires_a_new_request(client):
+    """A failed request cannot be resurrected by repainting its approval card."""
 
-    Its card is just as dead, so the option must still lead back to a usable approval.
-    """
     test_client, feishu_client = client
     await test_client.post('/events', json=event_payload('message.started', 0))
     await test_client.post('/events', json=event_payload('interaction.requested', 1, {
@@ -13396,10 +13382,10 @@ async def test_expired_approval_without_the_pause_marker_also_reissues(client):
         'action': {'value': option},
     }})
 
-    assert response.status == 200
-    assert '重新审批' in (await response.json())['toast']['content']
-    assert interaction.status == 'pending' and interaction.choice == ''
-    await _wait_until(lambda: len(feishu_client.sent) == cards_before + 1)
+    assert response.status == 409
+    assert '重新发送原请求' in (await response.json())['toast']['content']
+    assert interaction.status == 'failed' and interaction.choice == ''
+    assert len(feishu_client.sent) == cards_before
 
 
 @pytest.mark.parametrize('outcome', ['not_sent', 'unknown'])
@@ -13448,13 +13434,9 @@ async def test_paused_approval_notification_recovers_with_same_uuid(client, monk
     assert len(attempts) == 2
 
 
-async def test_paused_approval_resume_after_runtime_disappears_reissues_without_consent(client):
-    """A dead runtime must not turn the resume button into a dead end.
+async def test_paused_approval_after_runtime_disappears_explains_expiry_without_consent(client):
+    """A stale waiter yields an explicit terminal card, without consent or replacement."""
 
-    Clicking resume is never consent. When the agent that asked is gone the card cannot be
-    completed, so it is withdrawn, the approval is renewed with a fresh token and window, and a
-    fresh card is posted — the decision stays available instead of failing with nothing to click.
-    """
     test_client, feishu_client = client
     await test_client.post('/events', json=event_payload('message.started', 0))
     await test_client.post('/events', json=event_payload('interaction.requested', 1, {
@@ -13473,12 +13455,14 @@ async def test_paused_approval_resume_after_runtime_disappears_reissues_without_
     response = await test_client.post('/card/actions', json={'event': {
         'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'}, 'action': {'value': resume},
     }})
-    assert response.status == 200
-    assert interaction.status == 'pending' and interaction.choice == ''
+    assert response.status == 409
+    result = await response.json()
+    assert '重新发送原请求' in result['toast']['content']
+    assert not interaction_buttons(result['card'])
+    assert interaction.status == 'failed' and interaction.choice == ''
     assert interaction.callback_token != withdrawn_token
-    await _wait_until(lambda: dead_card_id in feishu_client.deleted)
-    await _wait_until(lambda: len(feishu_client.sent) == cards_before + 1)
-    assert interaction.feishu_message_id not in ('', dead_card_id)
+    assert feishu_client.deleted == []
+    assert len(feishu_client.sent) == cards_before
     replay = await test_client.post('/card/actions', json={'event': {
         'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'}, 'action': {'value': resume},
     }})
@@ -13665,6 +13649,19 @@ async def test_refused_recall_keeps_the_heartbeat_card_usable(client, monkeypatc
     assert feishu_client.deleted == []
     assert message_id in test_client.app[SESSIONS_KEY]
 
+async def test_session_heartbeat_never_recalls_final_answer(client, monkeypatch):
+    monkeypatch.setattr(sidecar_server, 'HEARTBEAT_RECALL_SECONDS', 0.03)
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 1, {}))
+    await test_client.post('/events', json=event_payload('system.notice', 2, {
+        'content': '⏳ Working — 3 min', 'notice_kind': 'heartbeat',
+        'notice_scope': 'session', 'notice_terminal': False,
+    }))
+    await test_client.post('/events', json=event_payload('message.completed', 3, {'answer': '完整答案'}))
+    await _REAL_ASYNCIO_SLEEP(0.15)
+    assert feishu_client.deleted == []
+    assert test_client.app[SESSIONS_KEY]
+
 
 async def test_recall_schedule_withdraws_a_message_once_its_delay_elapses(client):
     """The gateway cannot delete its own Feishu messages, so it delegates the recall to the sidecar.
@@ -13731,3 +13728,32 @@ async def test_a_refused_recall_is_counted_and_leaves_the_message_alone(client):
     await _wait_until(lambda: test_client.app[METRICS_KEY].ephemeral_recall_failures)
     assert feishu_client.deleted == []
     assert test_client.app[METRICS_KEY].ephemeral_recalls_completed == 0
+
+@pytest.mark.parametrize('delay', ['nan', 'inf', '-inf'])
+async def test_recall_rejects_nonfinite_delays(client, delay):
+    http, fake = client
+    response = await http.post('/recall/schedule', json={'message_id':'om_ack', 'delay_seconds':delay})
+    assert response.status == 400
+    assert fake.deleted == []
+
+
+async def test_recall_deduplicates_and_bounds_pending_tasks(client, monkeypatch):
+    http, fake = client
+    monkeypatch.setattr(sidecar_server, 'EPHEMERAL_RECALL_MAX_PENDING', 1)
+    payload = {'message_id':'om_ack', 'delay_seconds':60}
+    assert (await http.post('/recall/schedule', json=payload)).status == 200
+    assert (await http.post('/recall/schedule', json=payload)).status == 200
+    assert len(http.app[sidecar_server.EPHEMERAL_RECALL_TASKS_KEY]) == 1
+    assert (await http.post('/recall/schedule', json={**payload,'message_id':'om_other'})).status == 429
+    assert http.app[METRICS_KEY].ephemeral_recalls_scheduled == 1
+
+
+async def test_recall_never_removes_owned_answer_even_after_schedule(client):
+    http, fake = client
+    http.app[FEISHU_MESSAGE_IDS_KEY]['fixture'] = 'om_owned'
+    response = await http.post('/recall/schedule', json={'message_id':'om_owned', 'delay_seconds':0})
+    assert response.status == 409
+    assert (await http.post('/recall/schedule', json={'message_id':'om_later', 'delay_seconds':0.03})).status == 200
+    http.app[FEISHU_MESSAGE_IDS_KEY]['fixture'] = 'om_later'
+    await _REAL_ASYNCIO_SLEEP(0.1)
+    assert fake.deleted == []

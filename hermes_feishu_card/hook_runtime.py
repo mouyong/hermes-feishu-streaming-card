@@ -74,7 +74,7 @@ DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
 # correction.") tells the user their correction landed. Once read it is only a stale instruction in
 # the thread, so the sidecar withdraws it this many seconds later. Steer / queued / interrupt
 # acknowledgements state something the user still needs and are deliberately left alone.
-BUSY_REDIRECT_ACK_MARKER = "↪ Redirected current run"
+BUSY_REDIRECT_ACK_PREFIX = "↪ Redirected current run"
 BUSY_REDIRECT_ACK_RECALL_SECONDS = 15.0
 DEFAULT_TIMEOUT_SECONDS = 0.8
 INTERACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -4857,6 +4857,22 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
         return background_notice
     text = raw_text.strip()
     lowered = text.lower()
+    if text == "⏳ Gateway is restarting and is not accepting new work right now.":
+        return {
+            "title": "Gateway 正在重启", "level": "warning",
+            "notice_kind": "gateway-restart", "notice_id": "gateway-restart-wait",
+            "notice_terminal": True,
+            "content": "Gateway 正在重启，暂不接受新任务。当前这条请求尚未开始执行。\n\n"
+                       "重启耗时取决于正在收尾的任务和启动过程；收到重启完成通知后，请重新发送请求。",
+        }
+    if text in {"♻ Gateway restarted successfully. Your session continues.",
+                "♻️ Gateway restarted successfully. Your session continues."}:
+        return {
+            "title": "Gateway 重启完成", "level": "success",
+            "notice_kind": "gateway-restart", "notice_id": "gateway-restart-ready",
+            "notice_terminal": True,
+            "content": "Gateway 已重启完成，会话已保留。现在可以发送新任务。",
+        }
     if text.startswith("📬 No home channel is set for Feishu."):
         return {
             "title": "默认投递位置未设置", "level": "info",
@@ -5159,7 +5175,7 @@ def _hfc_build_system_notice_payload(
         "chat_id": chat_id,
         "conversation_id": conversation_id,
         "message_id": message_id,
-        "content": content,
+        "content": notice.get("content", content),
         "_hfc_notice_title": notice.get("title") or "运行提示",
         "_hfc_notice_level": notice.get("level") or "info",
         "_hfc_notice_kind": notice.get("notice_kind") or "system",
@@ -5892,7 +5908,7 @@ async def _hfc_feishu_send_with_native_handoff_tracking(
         raise RuntimeError("original Feishu retry helper unavailable")
     tracker = _HFC_NATIVE_HANDOFF_SEND_TRACKER.get()
     if not isinstance(tracker, dict):
-        response = await original(
+        return await original(
             self,
             chat_id=chat_id,
             msg_type=msg_type,
@@ -5900,8 +5916,6 @@ async def _hfc_feishu_send_with_native_handoff_tracking(
             reply_to=reply_to,
             metadata=metadata,
         )
-        await recall_busy_redirect_ack_async(msg_type, payload, response)
-        return response
     fallback_ordinal = tracker.get("fallback_ordinal")
     if msg_type == "text" and isinstance(fallback_ordinal, int):
         ordinal = fallback_ordinal
@@ -5923,7 +5937,6 @@ async def _hfc_feishu_send_with_native_handoff_tracking(
             reply_to=reply_to,
             metadata=metadata,
         )
-        await recall_busy_redirect_ack_async(msg_type, payload, response)
         succeeded = _native_handoff_response_succeeded(self, response)
         required[ordinal] = succeeded
         failures = tracker.setdefault("failures", {})
@@ -5967,15 +5980,16 @@ async def _hfc_topic_anchor_for_send(
         anchor = await fetch(thread_id)
     except Exception as exc:
         logger.warning(
-            "[hermes-feishu-card] topic anchor lookup failed for %s: %s", thread_id, exc
+            "[hermes-feishu-card] topic anchor lookup failed: thread_hash=%s error_kind=%s",
+            sha256(thread_id.encode()).hexdigest()[:12], type(exc).__name__
         )
         return ""
     anchor = str(anchor or "").strip()
     if not anchor:
         logger.warning(
-            "[hermes-feishu-card] no anchor inside topic %s; falling back to an unanchored send, "
+            "[hermes-feishu-card] no anchor inside topic thread_hash=%s; falling back to an unanchored send, "
             "which becomes a NEW topic in a topic group",
-            thread_id,
+            sha256(thread_id.encode()).hexdigest()[:12],
         )
     return anchor
 
@@ -9321,51 +9335,30 @@ def _post_json_sync_response(url: str, payload: dict[str, Any], timeout: float) 
     return _open_json_request(req, timeout)
 
 
-async def recall_busy_redirect_ack_async(msg_type: Any, payload: Any, response: Any) -> bool:
-    """Withdraw the busy-path redirect acknowledgement once it has been delivered.
+async def recall_busy_redirect_ack_async(event: Any, content: Any, result: Any) -> bool:
+    """Withdraw the busy-path redirect acknowledgement once the user has read it.
 
     ``↪ Redirected current run. I'll adjust using your correction.`` confirms the correction was
-    taken; after that it is a stale instruction sitting in the thread. Other busy replies (steer,
-    queued, interrupt) state something the user still needs, so only the redirect acknowledgement is
-    withdrawn.
-
-    Called from the ``_feishu_send_with_retry`` wrapper — the one place that sees both the outgoing
-    text and the delivered message id. The gateway cannot delete its own Feishu messages (its adapter
-    inherits the ``return False`` default), so the sidecar performs the recall. Best-effort
-    throughout: a failed request must never disturb a send that already succeeded.
+    taken; after that it is a stale instruction sitting in the thread, so it is recalled a few
+    seconds later. Other busy replies (steer, queued, interrupt) state something the user still
+    needs, so only the redirect acknowledgement is withdrawn. Best-effort throughout: a failed
+    request must never disturb the send that already succeeded.
     """
     try:
-        if BUSY_REDIRECT_ACK_MARKER not in str(payload or ""):
+        if not str(content or "").startswith(BUSY_REDIRECT_ACK_PREFIX):
             return False
-        message_id = _response_message_id(response)
-        if not message_id:
+        if getattr(result, "success", False) is not True:
+            return False
+        source = getattr(event, "source", None)
+        platform = getattr(source, "platform", "")
+        if "feishu" not in str(getattr(platform, "value", platform) or "").lower():
             return False
         return await schedule_message_recall_async(
-            message_id,
+            str(getattr(result, "message_id", "") or ""),
             delay_seconds=BUSY_REDIRECT_ACK_RECALL_SECONDS,
         )
     except Exception:
         return False
-
-
-def _response_message_id(response: Any) -> str:
-    """The message id of a delivered Feishu send, across the shapes the SDK returns.
-
-    The lark client hands back an object with ``.data.message_id``; a bare dict (or a test double)
-    carries the same value under keys. Unknown shapes return "" rather than raising — the caller is
-    best-effort by contract.
-    """
-    data = getattr(response, "data", None)
-    if data is None and isinstance(response, dict):
-        data = response.get("data")
-    for source in (data, response):
-        for name in ("message_id",):
-            value = getattr(source, name, None)
-            if value is None and isinstance(source, dict):
-                value = source.get(name)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return ""
 
 
 async def schedule_message_recall_async(
