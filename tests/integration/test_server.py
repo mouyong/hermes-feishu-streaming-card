@@ -13820,6 +13820,76 @@ async def test_superseding_notices_retire_the_previous_one_of_their_family(clien
     assert feishu_client.deleted == ["om_restart_warning"]
 
 
+async def test_any_new_message_clears_the_restart_group_in_front_of_it(client):
+    """Any message the bot posts retires the restart notices standing in that chat.
+
+    A restart group has no lifetime of its own — what ends it is the NEXT message, whichever message
+    that is (「任何一条自己发的消息都要把该话题前面的重启组清掉，同时触发 home channel 前面的重启消息
+    撤回」). The sidecar applies this on its own sends; plain-text sends that never reach it (the home
+    channel) go through ``/recall/supersede`` instead.
+    """
+    test_client, feishu_client = client
+    route = {"chat_id": "oc_topic", "conversation_id": "omt_topic"}
+
+    registered = await test_client.post(
+        "/recall/schedule",
+        json={"message_id": "om_restart_warning", "record_only": True,
+              "supersede_key": "restart-notice:default:oc_topic:omt_topic", "route": route},
+    )
+    assert registered.status == 200
+    assert feishu_client.deleted == []
+
+    # A message in ANOTHER chat must not clear this one's group.
+    elsewhere = await test_client.post(
+        "/recall/supersede",
+        json={"route": {"chat_id": "oc_elsewhere", "conversation_id": "omt_elsewhere"}},
+    )
+    assert elsewhere.status == 200
+    assert (await elsewhere.json())["withdrawn"] == 0
+    assert feishu_client.deleted == []
+
+    # A plain-text send in the same chat clears it.
+    sent = await test_client.post("/recall/supersede", json={"route": route})
+    assert sent.status == 200
+    assert (await sent.json())["withdrawn"] == 1
+    await _wait_until(lambda: feishu_client.deleted)
+    assert feishu_client.deleted == ["om_restart_warning"]
+
+    # The key is dropped with the notice: a second message has nothing left to clear.
+    again = await test_client.post("/recall/supersede", json={"route": route})
+    assert (await again.json())["withdrawn"] == 0
+
+
+async def test_a_new_card_clears_the_restart_group_posted_before_it(client):
+    """The bot's own card — the way a turn's reply arrives — clears the group too.
+
+    This is the path that matters in practice: a restart drops "⚠️ … restarting" and "♻️ … online"
+    into the thread, and the next turn's card is the first thing the user actually wants to read.
+    """
+    test_client, feishu_client = client
+    route = {"chat_id": "oc_card", "conversation_id": "omt_card"}
+
+    await test_client.post(
+        "/recall/schedule",
+        json={"message_id": "om_restart_warning", "record_only": True,
+              "supersede_key": "restart-notice:default:oc_card:omt_card", "route": route},
+    )
+    assert feishu_client.deleted == []
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started", 1, {"answer": "开始", "delivery_kind": "notice"},
+            conversation_id="omt_card", message_id="om_turn_card",
+            chat_id="oc_card", thread_id="omt_card",
+        ),
+    )
+    assert started.status == 200
+
+    await _wait_until(lambda: feishu_client.deleted)
+    assert "om_restart_warning" in feishu_client.deleted
+
+
 async def test_recall_schedule_clamps_the_delay_and_requires_a_message_id(client):
     """A caller may not pin a deletion far into the future, and an empty id is a client error."""
     test_client, feishu_client = client

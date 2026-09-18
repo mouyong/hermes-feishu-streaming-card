@@ -171,6 +171,53 @@ async def test_notice_recall_does_not_guess_unknown_platform_names(monkeypatch, 
     assert calls == []
 
 
+@pytest.mark.asyncio
+async def test_plain_text_egress_clears_the_restart_group_behind_a_normal_message(monkeypatch):
+    """An ordinary message retires the restart group in front of it, on the plain-text door.
+
+    The sidecar clears the group on its own card sends; this arm exists for the sends that never
+    reach it — the home channel's plain-text notices. It must NOT fire for the restart notices
+    themselves (those register instead), and a failure to reach the sidecar must not disturb the send.
+    """
+    posted = []
+
+    async def post(url, payload, timeout):
+        posted.append((url, payload))
+        return {"ok": True, "withdrawn": 2}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", post)
+    monkeypatch.setattr(hook_runtime, "_transient_notice_recall_seconds", lambda content: None)
+
+    assert await hook_runtime._hfc_recall_plain_text_status_notice(
+        "oc_home", "本轮回复结束", {"thread_id": "omt_x"}, SimpleNamespace(
+            success=True, message_id="om_plain")
+    )
+    assert len(posted) == 1
+    url, payload = posted[0]
+    assert url.endswith("/recall/supersede")
+    assert payload["route"]["chat_id"] == "oc_home"
+    assert payload["route"]["conversation_id"] == "omt_x"
+
+    # A restart notice registers itself instead of clearing — it IS the group.
+    posted.clear()
+    assert await hook_runtime._hfc_recall_plain_text_status_notice(
+        "oc_home",
+        "♻️ Gateway online — Hermes is back and ready.",
+        {"thread_id": "omt_x"},
+        SimpleNamespace(success=True, message_id="om_online"),
+    )
+    assert [p[0].rsplit("/", 1)[-1] for p in posted] == ["schedule"]
+    assert posted[0][1]["record_only"] is True
+
+    # Best-effort: an unreachable sidecar yields 0 and never raises.
+    async def boom(*args, **kwargs):
+        raise RuntimeError("sidecar down")
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", boom)
+    assert await hook_runtime.supersede_restart_group_async(
+        SimpleNamespace(platform="feishu", chat_id="oc_home", thread_id="omt_x"), "oc_home") == 0
+
+
 def test_only_the_restart_family_is_treated_as_self_retiring():
     """The restart pair retires itself; nothing else is caught by the prefix check.
 

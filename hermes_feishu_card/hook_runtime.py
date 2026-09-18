@@ -6511,7 +6511,15 @@ async def _hfc_recall_plain_text_status_notice(
         )
         if _hfc_is_restart_notice(content):
             return await supersede_restart_notice_async(source, chat_id, content, result)
-        return await recall_transient_thread_notice_async(source, content, result)
+        # Any OTHER message the bot posts retires the restart group in front of it («任何一条自己发的
+        # 消息都要把该话题前面的重启组清掉，同时触发 home channel 前面的重启消息撤回»). The sidecar
+        # does this for its own card sends; this door covers the plain-text sends that never reach it —
+        # which is exactly how the home channel is notified.
+        cleared = await supersede_restart_group_async(source, chat_id)
+        recalled = await recall_transient_thread_notice_async(source, content, result)
+        # True when EITHER arm retired something: the callers use this only as "a withdrawal was
+        # armed", and clearing a restart group is exactly that.
+        return bool(recalled or cleared)
     except Exception:
         return False
 
@@ -9783,6 +9791,42 @@ async def recall_busy_redirect_ack_async(event: Any, content: Any, result: Any) 
                                         BUSY_STEER_ACK_PREFIX)):
         return False
     return await recall_transient_thread_notice_async(event, content, result)
+
+
+async def supersede_restart_group_async(source: Any, chat_id: str) -> int:
+    """Clear the restart notices registered in front of ``chat_id`` now that something else was sent.
+
+    The sidecar retires the group itself on the sends IT makes (card send and card update), but the
+    gateway also posts plain text straight through its adapter — the home-channel notices, and any
+    send the turn machinery makes outside a card. Those never touch the sidecar's send path, so this
+    calls ``/recall/supersede`` from the plain-text egress door, which is the one place every such
+    send passes through. The user's rule: 「任何一条自己发的消息都要把该话题前面的重启组清掉，同时触发
+    home channel 前面的重启消息撤回」.
+
+    Returns the number of notices withdrawn (0 when nothing was registered or the call failed);
+    best-effort throughout, so a failure can never disturb the send that just succeeded.
+    """
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return 0
+        profile, provenance = _profile_identity({}, source, None)
+        if provenance.startswith("sanitized_"):
+            return 0
+        route = {
+            "profile_id": profile,
+            "chat_id": _first_attr_string(source, ("chat_id",)) or str(chat_id or ""),
+            "conversation_id": _first_attr_string(source, ("thread_id",)) or "",
+        }
+        url = f"{_summary_base_url(config.event_url)}/recall/supersede"
+        result = await _post_json_ordered_response(
+            url, {"route": route}, config.timeout_seconds
+        )
+        if isinstance(result, dict) and result.get("ok") is True:
+            return int(result.get("withdrawn") or 0)
+        return 0
+    except Exception:
+        return 0
 
 
 async def schedule_message_recall_async(

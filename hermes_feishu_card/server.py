@@ -658,6 +658,7 @@ def create_app(
     app.router.add_post("/runtime/events", _runtime_events)
     app.router.add_post("/delivery/policy", _delivery_policy)
     app.router.add_post("/recall/schedule", _recall_schedule)
+    app.router.add_post("/recall/supersede", _recall_supersede)
     app.router.add_post("/native-handoff/ack", _native_handoff_ack)
     app.router.add_post("/native-handoff/recover", _native_handoff_recover)
     app.router.add_post("/events", _events)
@@ -7217,6 +7218,12 @@ async def _send_card_for_app(
         return result
     metrics.feishu_send_retries += retry_count
     metrics.feishu_send_successes += 1
+    # Any message the bot posts retires the restart group standing in front of it («任何一条自己发的
+    # 消息都要把该话题前面的重启组清掉»). Done on the SEND, not on the text: a turn's reply arrives as
+    # a card, so this is the door every visible answer goes through.
+    _supersede_restart_group_for_route(
+        app, chat_id=chat_id, conversation_id=_safe_command_string(thread_id)
+    )
     return CardDeliveryResult(
         message_id=message_id,
         outcome="delivered",
@@ -7466,6 +7473,8 @@ async def _recall_schedule(request: web.Request) -> web.Response:
         supersede_key = supersede_key[:SUPERSEDE_KEY_MAX_LENGTH]
         registry = request.app[SUPERSEDED_NOTICE_IDS_KEY]
         previous = registry.get(supersede_key)
+        if isinstance(previous, dict):
+            previous = previous.get("message_id")
         if previous and previous != message_id:
             # Immediate, best-effort: a refusal (capacity, too old, already an owned card) leaves the
             # old notice in place, which is the pre-existing behaviour rather than a new failure mode.
@@ -7473,7 +7482,21 @@ async def _recall_schedule(request: web.Request) -> web.Response:
                 request.app, message_id=previous, delay_seconds=0.0, bot_id=bot_id
             ):
                 superseded = previous
-        registry[supersede_key] = message_id
+        # Stored with its route so a LATER send to the same place can find it: any message the bot
+        # posts clears the restart group standing in front of it (see
+        # ``_supersede_restart_group_for_route``).
+        route_chat = _safe_command_string(
+            (route_data or {}).get("chat_id") if isinstance(route_data, dict) else ""
+        )
+        route_thread = _safe_command_string(
+            (route_data or {}).get("conversation_id") if isinstance(route_data, dict) else ""
+        )
+        registry[supersede_key] = {
+            "message_id": message_id,
+            "bot_id": bot_id or "",
+            "chat_id": route_chat,
+            "conversation_id": route_thread,
+        }
     if payload.get("record_only") is True:
         return web.json_response(
             {"ok": True, "message_id": message_id, "record_only": True, "superseded": superseded}
@@ -7489,6 +7512,83 @@ async def _recall_schedule(request: web.Request) -> web.Response:
     return web.json_response(
         {"ok": True, "message_id": message_id, "delay_seconds": delay, "superseded": superseded}
     )
+
+
+def _supersede_restart_group_for_route(
+    app: web.Application, *, chat_id: str, conversation_id: str
+) -> list[str]:
+    """Withdraw the restart notices standing in front of a chat, now that something new was posted.
+
+    The user's rule: 「任何一条自己发的消息都要把该话题前面的重启组清掉，同时触发 home channel 前面的
+    重启消息撤回」. A restart group has no lifetime of its own — what retires it is the NEXT message in
+    that place, whichever message that is. So this is not tied to the restart notices themselves: it
+    runs on every send the sidecar makes (a card send, a card update, or a plain-text send relayed
+    through ``/recall/supersede``), and removes whatever restart notices were registered for that
+    chat/thread.
+
+    Matching is by chat, with the thread as a narrowing when both sides name one: a home-channel
+    broadcast and a topic notice do not cancel each other, but the FIRST message in a topic still
+    clears a group registered on that same chat. Entries belonging to another chat are left alone.
+
+    Best-effort: a refusal to schedule only leaves the old notice in place, and the key is dropped
+    either way (a stale key would otherwise re-target the same dead message on every send).
+    """
+    registry = app.get(SUPERSEDED_NOTICE_IDS_KEY)
+    if not isinstance(registry, dict) or not registry:
+        return []
+    target_chat = _safe_command_string(chat_id)
+    target_thread = _safe_command_string(conversation_id)
+    if not target_chat and not target_thread:
+        return []
+    withdrawn: list[str] = []
+    for key in list(registry.keys()):
+        entry = registry.get(key)
+        if not isinstance(entry, dict):
+            registry.pop(key, None)
+            continue
+        entry_chat = _safe_command_string(entry.get("chat_id"))
+        entry_thread = _safe_command_string(entry.get("conversation_id"))
+        if target_chat and entry_chat and entry_chat != target_chat:
+            continue
+        if target_thread and entry_thread and entry_thread != target_thread:
+            continue
+        if not target_chat and target_thread != entry_thread:
+            continue
+        message_id = _safe_command_string(entry.get("message_id"))
+        registry.pop(key, None)
+        if not message_id:
+            continue
+        if _schedule_ephemeral_recall(
+            app, message_id=message_id, delay_seconds=0.0, bot_id=entry.get("bot_id") or None
+        ):
+            withdrawn.append(message_id)
+    return withdrawn
+
+
+async def _recall_supersede(request: web.Request) -> web.Response:
+    """Clear the restart notices registered for a chat after an out-of-card send.
+
+    The sidecar clears the group itself on its own sends (card send/update), but the gateway also
+    posts plain text straight through its adapter — the home-channel notices, and any send the turn
+    machinery makes outside a card. Those never reach the sidecar's send path, so hfc calls this from
+    the plain-text egress door instead, which is the one place every such send passes through.
+    """
+    rejection = await _authenticate_sensitive_request(request)
+    if rejection is not None:
+        return rejection
+    try:
+        payload = json.loads(await request.read() or b"{}")
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"ok": False, "error": "payload must be an object"}, status=400)
+    route_data = payload.get("route") if isinstance(payload.get("route"), dict) else {}
+    withdrawn = _supersede_restart_group_for_route(
+        request.app,
+        chat_id=_safe_command_string(route_data.get("chat_id")),
+        conversation_id=_safe_command_string(route_data.get("conversation_id")),
+    )
+    return web.json_response({"ok": True, "withdrawn": len(withdrawn)})
 
 
 def _schedule_ephemeral_recall(app, *, message_id, delay_seconds, bot_id) -> bool:
@@ -7581,6 +7681,16 @@ async def _update_card_for_app(
         metrics.feishu_update_successes += 1
         if is_current is not None and not is_current():
             return False
+        # A card being updated IS the bot speaking in that chat, so it retires the restart group in
+        # front of it too («任何一条自己发的消息都要把该话题前面的重启组清掉»). The route is read back
+        # from the session this card belongs to — an update carries only a message id.
+        session = app.get(SESSIONS_KEY, {}).get(message_id)
+        if session is not None:
+            _supersede_restart_group_for_route(
+                app,
+                chat_id=_safe_command_string(getattr(session, "chat_id", "")),
+                conversation_id=_safe_command_string(getattr(session, "conversation_id", "")),
+            )
         return True
     if notice_update:
         metrics.notice_update_failures += 1
