@@ -7,6 +7,16 @@ from hermes_feishu_card.install import patcher
 
 HEARTBEAT = "⏳ Working — 12 min — iteration 42/150, receiving stream response"
 REDIRECT = "↪ Redirected current run. I'll adjust using your correction."
+# The two ⌛ strings a Feishu user can actually receive — an approval card clicked too late, and an
+# approval nobody answered in time. Verbatim heads of the core senders.
+APPROVAL_CLICKED_TOO_LATE = (
+    "⌛ That approval had already expired — the command was not run "
+    "(it timed out or was resolved elsewhere)."
+)
+APPROVAL_TIMED_OUT = (
+    "⌛ Approval timed out after 5 minutes — the command was NOT run. "
+    "Ask me to try again if you still want it, or raise approvals.timeout in config.yaml."
+)
 PROVIDER_FAILURE = (
     "⚠️ The model provider failed after retries. I kept raw provider details out of chat; "
     "check gateway logs for diagnostics."
@@ -84,10 +94,26 @@ async def test_only_transient_notices_are_withdrawn(monkeypatch):
     assert calls == [("om_notice", 15.0)]
     assert await hook_runtime.recall_transient_thread_notice_async(feishu, REDIRECT, sent)
 
+    # The approval-expiry receipts are withdrawn too: a click that lands after the wait ended, and
+    # the timeout notice nobody answered. Both describe a decision that is already over, and the
+    # user asked for them to stop cluttering the thread
+    # (「如果用户点了审批的交互，那么应该撤销 … 让会话流干净一点」).
+    calls.clear()
+    assert await hook_runtime.recall_transient_thread_notice_async(
+        feishu, APPROVAL_CLICKED_TOO_LATE, sent)
+    assert await hook_runtime.recall_transient_thread_notice_async(feishu, APPROVAL_TIMED_OUT, sent)
+    assert calls == [("om_notice", 15.0)] * 2
+
     calls.clear()
     # Content the user still needs, a failed send, a non-Feishu platform and a missing id all stay.
     assert not await hook_runtime.recall_transient_thread_notice_async(feishu, PROVIDER_FAILURE, sent)
     assert not await hook_runtime.recall_transient_thread_notice_async(feishu, "改完了。", sent)
+    # The prefix is the head of the string only: a user QUOTING a ⌛ line back at the bot, or any
+    # answer that merely mentions an expired approval, is a message in its own right and must stay.
+    assert not await hook_runtime.recall_transient_thread_notice_async(
+        feishu, "我看了这段 ⌛ Approval timed out 日志，帮我分析", sent)
+    assert not await hook_runtime.recall_transient_thread_notice_async(
+        feishu, "The approval expired before I clicked.", sent)
     assert not await hook_runtime.recall_transient_thread_notice_async(
         feishu, HEARTBEAT, SimpleNamespace(success=False, message_id="om_x"))
     assert not await hook_runtime.recall_transient_thread_notice_async(
