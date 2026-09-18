@@ -119,7 +119,7 @@ def render_card(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
-    show_completed_tool_activity: bool = True,
+    hide_completed_tool_activity: bool = True,
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -138,7 +138,7 @@ def render_card(
         mentions_enabled=mentions_enabled,
         reasoning_format=reasoning_format,
         completion_mention=completion_mention,
-        show_completed_tool_activity=show_completed_tool_activity,
+        hide_completed_tool_activity=hide_completed_tool_activity,
     ).card
 
 
@@ -159,7 +159,7 @@ def render_card_result(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
-    show_completed_tool_activity: bool = True,
+    hide_completed_tool_activity: bool = True,
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(session)
     table_overflow = transform_table_overflow(
@@ -183,7 +183,7 @@ def render_card_result(
         mentions_enabled=mentions_enabled,
         reasoning_format=reasoning_format,
         completion_mention=completion_mention,
-        show_completed_tool_activity=show_completed_tool_activity,
+        hide_completed_tool_activity=hide_completed_tool_activity,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -227,7 +227,7 @@ def _render_card_unchecked(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
-    show_completed_tool_activity: bool = True,
+    hide_completed_tool_activity: bool = True,
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -308,18 +308,21 @@ def _render_card_unchecked(
                 used_roles=used_text_size_roles,
             ),
         )
-    # `card.show_completed_tool_activity` (default true = today's behaviour) decides whether a
-    # FINISHED turn keeps the content-area tool rows. While a turn runs they are the live progress
-    # line and the 思考过程 panel below does not exist yet; once it is done they restate entries that
-    # panel already holds — the reader wants the answer, and can open the panel for the process.
-    # Requested in issue #328, where `show_reasoning: false` turned out not to reach this block: the
-    # panel is gated on `show_reasoning` (a few lines below), these rows on `pending_approval` alone.
+    # `card.hide_completed_tool_activity` (default true) decides whether a FINISHED turn keeps the
+    # content-area tool rows. While a turn runs they are the live progress line and the 思考过程 panel
+    # below does not exist yet; once it is done they restate entries that panel already holds — the
+    # reader wants the answer, and can open the panel for the process. The user's rule:
+    # 「如果整个卡已经完成，那么正文里面最近的工具行也的确可以关闭展示了」.
+    #
+    # The switch is spelled `hide_` rather than `show_` because the DEFAULT is to hide: a finished
+    # card reads as answer + footer, and a deployment that wants the rows back sets it false. A
+    # `show_…: true` default would have meant the feature is off unless every deployment opts in.
     #
     # Deliberately NOT applied to a FAILED turn: there the rows carry the 已中断 pill, i.e. WHERE the
     # run stopped — the one thing a reader opens a failed card for (see _interrupted_tool_pill's
     # rationale). Hiding a stopped run's last step would delete the diagnostic, not the noise.
     hide_completed_rows = (
-        not show_completed_tool_activity
+        hide_completed_tool_activity
         and (display_status == "completed" or session.status == "completed")
     )
     tool_activity_elements = (

@@ -105,14 +105,18 @@ def test_render_completed_card_omits_zero_tool_timeline():
 
 
 def test_completed_turn_can_hide_the_tool_rows_without_touching_the_panel():
-    """Issue #328: `show_completed_tool_activity: false` drops the rows only on a COMPLETED turn.
+    """Issue #328: `hide_completed_tool_activity` (default true) drops the rows on a COMPLETED turn.
 
     The content-area rows are gated on `pending_approval` alone — `show_reasoning` reaches only the
     思考过程 panel — so a deployment that wants "answer + footer" on a finished card had no switch.
-    Contract, per the issue and the maintainer's reply: default true keeps today's behaviour; false
-    hides them once completed, leaves a running turn alone, and does NOT touch the panel or the
-    footer's 工具 #N count. A failed turn keeps its rows in both settings, because there they carry
-    the 已中断 pill naming where the run stopped.
+    Contract: true (the default) hides them once completed; false keeps them. Either way a running
+    turn is untouched, and neither the panel nor the footer's 工具 #N count is affected. A failed
+    turn keeps its rows in BOTH settings, because there they carry the 已中断 pill naming where the
+    run stopped.
+
+    Named `hide_` rather than `show_` because the default is to hide — the user's rule is
+    「如果整个卡已经完成，那么正文里面最近的工具行也的确可以关闭展示了」, so a `show_…: true` default
+    would have shipped the feature off.
     """
     from hermes_feishu_card.events import SidecarEvent
     from hermes_feishu_card.render import StatusConfig, render_card, resolve_display_status
@@ -162,16 +166,17 @@ def test_completed_turn_can_hide_the_tool_rows_without_touching_the_panel():
             assert resolved == status
         else:
             assert resolved not in {"completed", "failed"}
-        return render_card(session, show_completed_tool_activity=flag)
+        return render_card(session, hide_completed_tool_activity=flag)
 
-    assert rows(render("completed", True))
-    assert rows(render("completed", False)) == []
+    # Default (true) = a finished card is answer + footer only; false brings the rows back.
+    assert rows(render("completed", True)) == []
+    assert rows(render("completed", False))
 
     # A running turn is unaffected — this is the live progress line, and the panel is not up yet.
-    assert len(rows(render("running", False))) == len(rows(render("running", True)))
+    assert len(rows(render("running", True))) == len(rows(render("running", False)))
 
     # A failed turn keeps its rows: the 已中断 pill names where the run stopped.
-    assert len(rows(render("failed", False))) == len(rows(render("failed", True)))
+    assert len(rows(render("failed", True))) == len(rows(render("failed", False)))
 
 
 def test_tool_activity_keeps_every_running_tool_with_its_own_predecessor():

@@ -173,6 +173,14 @@ EPHEMERAL_RECALL_DEFAULT_SECONDS = 15.0
 EPHEMERAL_RECALL_MAX_SECONDS = 600.0
 EPHEMERAL_RECALL_MAX_PENDING = 1024
 EPHEMERAL_RECALL_TASKS_KEY = web.AppKey("ephemeral_recall_tasks", dict)
+# ``supersede_key`` -> message_id of the most recent notice in that family, per chat (see
+# ``_recall_schedule``). This lives in the SIDECAR rather than in the gateway because the notices it
+# supersedes are sent by DIFFERENT gateway processes: "⚠️ … restarting" comes from the process that is
+# shutting down, and "♻️ … online" from the one that boots in its place. The sidecar outlives both, so
+# it is the only place where "the previous one" can still be named.
+SUPERSEDED_NOTICE_IDS_KEY = web.AppKey("superseded_notice_ids", dict)
+# Upper bound on a caller-supplied ``supersede_key``: it is a map key, never echoed into a message.
+SUPERSEDE_KEY_MAX_LENGTH = 200
 BOT_ROUTER_KEY = web.AppKey("bot_router", Any)
 ROUTING_DIAGNOSTICS_KEY = web.AppKey("routing_diagnostics", dict)
 PROFILE_DIAGNOSTICS_KEY = web.AppKey("profile_diagnostics", dict)
@@ -579,6 +587,7 @@ def create_app(
     app[CARD_ANIMATION_TASKS_KEY] = {}
     app[HEARTBEAT_RECALL_TASKS_KEY] = {}
     app[EPHEMERAL_RECALL_TASKS_KEY] = {}
+    app[SUPERSEDED_NOTICE_IDS_KEY] = {}
     app[NATIVE_HANDOFF_STORE_KEY] = (
         native_handoff_store
         if native_handoff_store is not None
@@ -6869,8 +6878,8 @@ def _render_session_card_result_for_app(
         interaction_mode=interaction_mode,
         interaction_profile_id=interaction_profile_id,
         show_reasoning=_safe_bool(card_config.get("show_reasoning"), True),
-        show_completed_tool_activity=_safe_bool(
-            card_config.get("show_completed_tool_activity"), True
+        hide_completed_tool_activity=_safe_bool(
+            card_config.get("hide_completed_tool_activity"), True
         ),
         reasoning_format=card_config.get("reasoning_format", "panel"),
         timeline_expanded=_safe_bool(card_config.get("timeline_expanded"), False),
@@ -7442,6 +7451,33 @@ async def _recall_schedule(request: web.Request) -> web.Response:
         _client_for_bot(request.app, bot_id)
     except (RuntimeError, ValueError, KeyError):
         return web.json_response({"ok":False,"error":"recall route unavailable"}, status=409)
+    # A notice family that supersedes itself. ``supersede_key`` names the family (per chat/thread) and
+    # the PREVIOUS member is withdrawn the moment a new one lands. Built for the restart pair, where
+    # the "⚠️ restarting" half is sent by the process going down and the "♻️ online" half by the one
+    # that boots in its place — two processes, so the "previous one" can only be remembered here. The
+    # user's rule: 「重启提示和上线提示，在有新消息的时候把前面的撤回了」.
+    #
+    # ``record_only`` is for the member that must live until superseded: the caller wants the key
+    # updated WITHOUT a deadline of its own. Without it a superseding caller would have to invent a
+    # lifetime for a line whose whole point is that the next notice retires it.
+    supersede_key = _safe_command_string(payload.get("supersede_key"))
+    superseded: Optional[str] = None
+    if supersede_key:
+        supersede_key = supersede_key[:SUPERSEDE_KEY_MAX_LENGTH]
+        registry = request.app[SUPERSEDED_NOTICE_IDS_KEY]
+        previous = registry.get(supersede_key)
+        if previous and previous != message_id:
+            # Immediate, best-effort: a refusal (capacity, too old, already an owned card) leaves the
+            # old notice in place, which is the pre-existing behaviour rather than a new failure mode.
+            if _schedule_ephemeral_recall(
+                request.app, message_id=previous, delay_seconds=0.0, bot_id=bot_id
+            ):
+                superseded = previous
+        registry[supersede_key] = message_id
+    if payload.get("record_only") is True:
+        return web.json_response(
+            {"ok": True, "message_id": message_id, "record_only": True, "superseded": superseded}
+        )
     scheduled = _schedule_ephemeral_recall(
         request.app,
         message_id=message_id,
@@ -7450,7 +7486,9 @@ async def _recall_schedule(request: web.Request) -> web.Response:
     )
     if not scheduled:
         return web.json_response({"ok": False, "error": "recall capacity reached"}, status=429)
-    return web.json_response({"ok": True, "message_id": message_id, "delay_seconds": delay})
+    return web.json_response(
+        {"ok": True, "message_id": message_id, "delay_seconds": delay, "superseded": superseded}
+    )
 
 
 def _schedule_ephemeral_recall(app, *, message_id, delay_seconds, bot_id) -> bool:
