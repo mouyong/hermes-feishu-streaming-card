@@ -339,13 +339,30 @@ class CardSession:
                     previous_tool.detail,
                     resolved_detail,
                 )
-            if previous_tool is None or previous_is_terminal:
+            # Ordinal assignment. `ordinal` is what the card prints as `#N` and `_tool_call_count` is
+            # the `工具 #N` tally in the title, so a number that is consumed has to come with a NEW
+            # row — otherwise it is vacant forever and the reader sees a gap.
+            #
+            # Regression this guards (measured in the field): a tool that had gone terminal and then
+            # received another `running` event was re-numbered. Every hole found on disk had a
+            # running tool right after it — a checkpoint held ordinals [1…9, 11, 12] with 10 vacant
+            # and the running read_file on #11, which is what the reporter saw
+            # (「为什么工具 11 在执行，但是显示了前面的却是工具 9？那工具 10 怎么不见了」). All 11 ids in
+            # that checkpoint were unique, so the event was a replay/late tick for the SAME call, not
+            # a new one — a call that is already finished cannot become the fresh start of a call.
+            #
+            # Deliberately still re-numbering a repeated TERMINAL event: a tool id may be reused for
+            # a genuinely new execution (the upstream contract in
+            # `test_timeline_preserves_repeated_completed_tool_calls_with_same_id`: three `completed`
+            # events for one id are three calls and must count as three).
+            if previous_tool is None or (previous_is_terminal and is_terminal):
                 self._tool_call_count += 1
                 call_ordinal = self._tool_call_count
             elif previous_tool.ordinal:
                 call_ordinal = previous_tool.ordinal
             else:
                 # Pre-existing state (or a resumed session) with no ordinal recorded.
+                self._tool_call_count += 1
                 call_ordinal = self._tool_call_count
             self.tools[tool_id] = ToolState(
                 tool_id=tool_id,
