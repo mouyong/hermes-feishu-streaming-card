@@ -100,6 +100,42 @@ STATUS_NOTICE_RECALL_SECONDS = 15.0
 # other platform's ⌛ wording never reaches a Feishu send.
 APPROVAL_EXPIRED_NOTICE_PREFIX = "⌛"
 APPROVAL_EXPIRED_NOTICE_RECALL_SECONDS = 15.0
+# The restart notices: four strings, two halves. "⚠️ Hermes is restarting / shutting down …" warns that
+# the current task is about to be interrupted, and "♻️ Gateway online / ♻️ Gateway restarted …" says
+# it is back. They are NOT in TRANSIENT_THREAD_NOTICES because they have no lifetime of their own: a
+# restart warning is good until the gateway returns, and the online line is good until the next
+# restart — what retires them is the NEXT notice, not a clock.
+#
+# That next notice comes from a DIFFERENT process (the warning is sent by the process going down, the
+# online line by its replacement), so hfc cannot hold "the previous one" in memory; the withdrawal is
+# keyed in the SIDECAR, which outlives both. The user's rule, verbatim:
+# 「重启提示和上线提示，在有新消息的时候把前面的撤回了」.
+#
+# Both phrasings are listed: Hermes 0.21.0 said "⚠️ Gateway restarting — Your current task …" and
+# 0.21.3 says "⚠️ Hermes is restarting — your current task …", and a gateway updated mid-flight can
+# still have the older line sitting in the thread to be superseded.
+RESTART_NOTICE_PREFIXES = (
+    "⚠️ Hermes is restarting",
+    "⚠️ Hermes is shutting down",
+    "⚠️ Gateway restarting",
+    "⚠️ Gateway shutting down",
+    "♻️ Gateway online",
+    "♻️ Gateway restarted",
+    "♻ Gateway restarted",
+)
+# The prefix tuple above is only a cheap gate; the notice itself must then match its FULL known shape.
+# Same reason as the ⏳ arm: a warning emoji is not evidence that a message is disposable, and the user
+# quoting a restart line back at the bot is a message in its own right.
+RESTART_NOTICE_PATTERNS = (
+    r"⚠️ Hermes is restarting — your current task will be interrupted\. Send any message after the restart and I'll try to resume where you left off\.",
+    r"⚠️ Hermes is shutting down — your current task will be interrupted\. When it is back online, send any message and I'll try to pick up where we left off\.",
+    # The 0.21.0 wording; the tail is not worth pinning exactly, since only this head was ever shipped.
+    r"⚠️ Gateway (?:restarting|shutting down) — Your current task will be interrupted\.[^\r\n]*",
+    r"♻ Gateway restarted successfully\. Your session continues\.",
+    # The online notice may carry a second line (the free-tier note) appended by the boot path.
+    r"♻️ Gateway online — Hermes is back and ready\.(?:\n[^\r\n]*)?",
+)
+RESTART_NOTICE_SUPERSEDE_PREFIX = "restart-notice"
 # (text prefix, seconds to wait before withdrawing) — every transient notice hfc withdraws after the
 # user has had a chance to read it. Content the user still needs (queued acks, provider-
 # failure replies) is deliberately absent: only self-erasing status pings belong here.
@@ -108,7 +144,6 @@ TRANSIENT_THREAD_NOTICES: tuple[tuple[str, float], ...] = (
     (BUSY_INTERRUPT_ACK_PREFIX, BUSY_INTERRUPT_ACK_RECALL_SECONDS),
     (BUSY_STEER_ACK_PREFIX, BUSY_STEER_ACK_RECALL_SECONDS),
     (STATUS_NOTICE_PREFIX, STATUS_NOTICE_RECALL_SECONDS),
-    (APPROVAL_EXPIRED_NOTICE_PREFIX, APPROVAL_EXPIRED_NOTICE_RECALL_SECONDS),
 )
 DEFAULT_TIMEOUT_SECONDS = 0.8
 INTERACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -5108,6 +5143,13 @@ async def _hfc_send_plain_notice(
     try:
         result = await original(adapter, chat_id, text, reply_to=reply_to, metadata=metadata)
         if getattr(result, "success", False):
+            # This path deliberately bypasses the send wrapper, so it has to arm the withdrawal
+            # itself. The "♻️ Gateway online" notice is sent from here (the classifier swaps the core
+            # wording for `_HFC_GATEWAY_ONLINE_TEXT`), and without this call it would never be retired
+            # — neither by the restart family's supersede nor by anything else. A no-op for the other
+            # notices that share this path (📬 home-channel, ℹ️ compression deferred): both arms only
+            # act on content they recognise.
+            await _hfc_recall_plain_text_status_notice(chat_id, text, metadata, result)
             return result
         return _send_result(False, error="delivery_disposition=native")
     except Exception as exc:
@@ -6445,6 +6487,11 @@ async def _hfc_recall_plain_text_status_notice(
 
     Preserve native send success even if recall fails. A foreign or invalid
     context cannot select the bot that will delete the message.
+
+    Two arms: the transient status notices get a deadline (``TRANSIENT_THREAD_NOTICES``), while the
+    restart notices are handled by ``supersede_restart_notice_async`` — they carry no deadline of
+    their own and are retired by the NEXT notice, which may be sent by the next gateway process
+    (「重启提示和上线提示，在有新消息的时候把前面的撤回了」).
     """
     try:
         context = _HFC_FEISHU_DELIVERY_CONTEXT.get()
@@ -6462,6 +6509,8 @@ async def _hfc_recall_plain_text_status_notice(
             profile_id=str(context.get("profile_id") or ""),
             thread_id=str(metadata.get("thread_id") or context.get("thread_id") or ""),
         )
+        if _hfc_is_restart_notice(content):
+            return await supersede_restart_notice_async(source, chat_id, content, result)
         return await recall_transient_thread_notice_async(source, content, result)
     except Exception:
         return False
@@ -9664,6 +9713,22 @@ def _transient_notice_recall_seconds(content: Any) -> Optional[float]:
         return (STATUS_NOTICE_RECALL_SECONDS
                 if any(re.fullmatch(pattern, text) for pattern in status_patterns)
                 else None)
+    # The approval-expiry receipts. A user gets one of exactly two ⌛ lines when a decision is
+    # already over: they clicked an approval card whose wait had ended, or nobody answered it in
+    # time. Both say "the command was NOT run", nothing is waiting on the answer, and the user asked
+    # for them to stop cluttering the thread — 「如果用户点了审批的交互，那么应该撤销 … 让会话流干净一点」.
+    #
+    # Matched by full text, not by the emoji, for the same reason as the ⏳ family above: an
+    # hourglass alone is not evidence that a message is disposable. The timeout line also carries a
+    # variable window ("after 5 minutes", per ``approvals.timeout``), so it is matched by shape.
+    if text.startswith(APPROVAL_EXPIRED_NOTICE_PREFIX):
+        approval_patterns = (
+            r"⌛ That approval had already expired — the command was not run \([^\r\n]*\)\.",
+            r"⌛ Approval timed out after [^—\r\n]+ — the command was NOT run\.[^\r\n]*",
+        )
+        return (APPROVAL_EXPIRED_NOTICE_RECALL_SECONDS
+                if any(re.fullmatch(pattern, text) for pattern in approval_patterns)
+                else None)
     for prefix, delay in TRANSIENT_THREAD_NOTICES:
         if text.startswith(prefix):
             return delay
@@ -9726,12 +9791,19 @@ async def schedule_message_recall_async(
     delay_seconds: float = 15.0,
     bot_id: str = "",
     route: dict[str, str] | None = None,
+    supersede_key: str = "",
+    record_only: bool = False,
 ) -> bool:
     """Ask the sidecar to withdraw ``message_id`` ``delay_seconds`` after it was posted.
 
     Used for acknowledgements the user reads once and that then only clutter the thread — the
     core's "↪ Redirected current run …" notice. The gateway's own adapter cannot delete (its Feishu
     implementation inherits the ``return False`` default), so the sidecar owns this path.
+
+    ``supersede_key`` switches the call to the self-retiring mode (see ``RESTART_NOTICE_PREFIXES``):
+    the sidecar withdraws whatever was previously registered under that key and remembers this id
+    instead. ``record_only`` adds "…and give this message no deadline of its own", which is what the
+    restart notices need — they live until the next notice retires them.
     """
     try:
         recall_id = str(message_id or "").strip()
@@ -9748,9 +9820,69 @@ async def schedule_message_recall_async(
             payload["bot_id"] = str(bot_id)
         if route is not None:
             payload["route"] = dict(route)
+        if supersede_key:
+            payload["supersede_key"] = str(supersede_key)
+        if record_only:
+            payload["record_only"] = True
         url = f"{_summary_base_url(config.event_url)}/recall/schedule"
         result = await _post_json_ordered_response(url, payload, config.timeout_seconds)
         return isinstance(result, dict) and result.get("ok") is True
+    except Exception:
+        return False
+
+
+def _hfc_is_restart_notice(content: Any) -> bool:
+    """True for the restart/online notices that retire each other (see ``RESTART_NOTICE_PREFIXES``)."""
+    text = str(content or "")
+    if not text or not text.startswith(RESTART_NOTICE_PREFIXES):
+        return False
+    return any(re.fullmatch(pattern, text) for pattern in RESTART_NOTICE_PATTERNS)
+
+
+async def supersede_restart_notice_async(
+    source: Any, chat_id: str, content: Any, result: Any
+) -> bool:
+    """Retire the previous restart notice now that a newer one has landed.
+
+    Keyed per chat AND thread so a home broadcast and a thread notice do not cancel each other, and
+    registered in the SIDECAR because the two halves of a restart are sent by different gateway
+    processes — the warning by the one shutting down, the online line by its replacement. In-memory
+    state in the gateway would be empty exactly when it is needed.
+
+    Best-effort throughout: a failed registration must never disturb a send that already succeeded,
+    so every failure path returns False instead of raising.
+    """
+    try:
+        if getattr(result, "success", False) is not True:
+            return False
+        platform = getattr(source, "platform", "")
+        if str(getattr(platform, "value", platform) or "").lower() != "feishu":
+            return False
+        message_id = str(getattr(result, "message_id", "") or "")
+        if not message_id:
+            return False
+        profile, provenance = _profile_identity({}, source, None)
+        if provenance.startswith("sanitized_"):
+            return False
+        thread_id = _first_attr_string(source, ("thread_id",)) or ""
+        key = "%s:%s:%s:%s" % (
+            RESTART_NOTICE_SUPERSEDE_PREFIX,
+            profile,
+            chat_id or _first_attr_string(source, ("chat_id",)) or "",
+            thread_id,
+        )
+        route = {
+            "profile_id": profile,
+            "chat_id": _first_attr_string(source, ("chat_id",)) or "",
+            "conversation_id": thread_id,
+        }
+        return await schedule_message_recall_async(
+            message_id,
+            delay_seconds=0.0,
+            route=route,
+            supersede_key=key,
+            record_only=True,
+        )
     except Exception:
         return False
 

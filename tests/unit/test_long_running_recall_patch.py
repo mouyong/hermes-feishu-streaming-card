@@ -169,3 +169,75 @@ async def test_notice_recall_does_not_guess_unknown_platform_names(monkeypatch, 
         SimpleNamespace(platform=platform), HEARTBEAT,
         SimpleNamespace(success=True, message_id='notice-fixture'))
     assert calls == []
+
+
+def test_only_the_restart_family_is_treated_as_self_retiring():
+    """The restart pair retires itself; nothing else is caught by the prefix check.
+
+    Both phrasings are accepted because a gateway updated mid-flight can still have the older line
+    ("⚠️ Gateway restarting — Your current task …") sitting in a thread to be superseded.
+    """
+    for text in (
+        "⚠️ Hermes is restarting — your current task will be interrupted. Send any message after "
+        "the restart and I'll try to resume where you left off.",
+        "⚠️ Hermes is shutting down — your current task will be interrupted. When it is back "
+        "online, send any message and I'll try to pick up where we left off.",
+        "⚠️ Gateway restarting — Your current task will be interrupted.",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        "♻️ Gateway online — Hermes is back and ready.",
+        "♻ Gateway restarted successfully. Your session continues.",
+    ):
+        assert hook_runtime._hfc_is_restart_notice(text), text
+
+    for text in (
+        # A user quoting a notice back at the bot is a message in its own right.
+        "⚠️ Hermes is restarting 这条我看不懂，解释一下",
+        "Gateway online",
+        HEARTBEAT,
+        "改完了。",
+        "",
+        None,
+    ):
+        assert not hook_runtime._hfc_is_restart_notice(text), text
+
+
+@pytest.mark.asyncio
+async def test_plain_text_egress_retires_restart_notices_and_expires_status_notices(monkeypatch):
+    """On the plain-text door the two families are routed to different arms of the same hook.
+
+    The restart notices must NOT go through the transient table: they have no deadline of their own
+    (a restart warning is good until the gateway is back), so they are registered as self-retiring
+    entries keyed per chat. The status notices keep their 15s clock.
+    """
+    scheduled = []
+
+    async def schedule(message_id, **kwargs):
+        scheduled.append((message_id, kwargs))
+        return True
+
+    monkeypatch.setattr(hook_runtime, 'schedule_message_recall_async', schedule)
+    sent = SimpleNamespace(success=True, message_id='om_notice')
+
+    assert await hook_runtime._hfc_recall_plain_text_status_notice(
+        'oc_chat',
+        "⚠️ Hermes is restarting — your current task will be interrupted. Send any message after "
+        "the restart and I'll try to resume where you left off.",
+        {'thread_id': 'omt_thread'},
+        sent,
+    )
+    assert len(scheduled) == 1
+    message_id, kwargs = scheduled[0]
+    assert message_id == 'om_notice'
+    # Self-retiring: registered under a per-chat key, with no deadline of its own.
+    assert kwargs['record_only'] is True
+    assert kwargs['supersede_key'].startswith('restart-notice:')
+    assert kwargs['supersede_key'].endswith('oc_chat:omt_thread')
+
+    scheduled.clear()
+    assert await hook_runtime._hfc_recall_plain_text_status_notice(
+        'oc_chat', HEARTBEAT, {'thread_id': 'omt_thread'}, sent)
+    assert len(scheduled) == 1
+    _, kwargs = scheduled[0]
+    assert kwargs.get('record_only') is not True
+    assert not kwargs.get('supersede_key')
+    assert kwargs['delay_seconds'] == 15.0

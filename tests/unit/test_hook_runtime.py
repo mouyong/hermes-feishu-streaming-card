@@ -13438,7 +13438,13 @@ def test_restart_completion_notice_is_sent_as_text_not_a_card(monkeypatch):
             return SimpleNamespace(success=True, message_id="om_plain")
 
     def no_card(*args, **kwargs):
-        pytest.fail("the restart-completion notice must not post a card payload")
+        # ``_post_json_ordered_response`` carries BOTH a card/render payload and the RECALL request.
+        # Only the former is forbidden here: the online line now arms its own withdrawal, because the
+        # restart pair retires itself (the next restart's "⚠️" notice withdraws this one). A recall
+        # posts a message id to be deleted — no card, no content.
+        url = args[0] if args else kwargs.get("url", "")
+        assert "/recall/" in str(url), "the restart-completion notice must not post a card payload"
+        return {"ok": True}
 
     monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", no_card)
 

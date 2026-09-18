@@ -13775,6 +13775,51 @@ async def test_recall_schedule_withdraws_a_message_once_its_delay_elapses(client
     assert test_client.app[METRICS_KEY].ephemeral_recall_failures == 0
 
 
+async def test_superseding_notices_retire_the_previous_one_of_their_family(client):
+    """A self-retiring notice family: the new member withdraws the old one and keeps no deadline.
+
+    The restart pair needs this because its two halves are sent by DIFFERENT gateway processes — the
+    "⚠️ … restarting" line by the process shutting down and the "♻️ online" line by the one that boots
+    in its place — so "the previous one" is only nameable in the sidecar, which outlives both.
+    ``record_only`` keeps the newest member alive: it is retired by the NEXT notice, not by a clock.
+    """
+    test_client, feishu_client = client
+
+    first = await test_client.post(
+        "/recall/schedule",
+        json={"message_id": "om_restart_warning", "record_only": True,
+              "supersede_key": "restart-notice:default:oc_x:"},
+    )
+    assert first.status == 200
+    first_body = await first.json()
+    assert first_body["ok"] is True
+    assert first_body["superseded"] is None
+    # A record_only member gets no deadline of its own — it must still be readable.
+    assert feishu_client.deleted == []
+    assert test_client.app[METRICS_KEY].ephemeral_recalls_scheduled == 0
+
+    second = await test_client.post(
+        "/recall/schedule",
+        json={"message_id": "om_gateway_online", "record_only": True,
+              "supersede_key": "restart-notice:default:oc_x:"},
+    )
+    assert second.status == 200
+    assert (await second.json())["superseded"] == "om_restart_warning"
+    await _wait_until(lambda: feishu_client.deleted)
+    assert feishu_client.deleted == ["om_restart_warning"]
+
+    # The key is per chat: a different chat's notice must not retire this one, or a home-channel
+    # broadcast would delete a thread's warning.
+    third = await test_client.post(
+        "/recall/schedule",
+        json={"message_id": "om_other_chat", "record_only": True,
+              "supersede_key": "restart-notice:default:oc_other:"},
+    )
+    assert third.status == 200
+    assert (await third.json())["superseded"] is None
+    assert feishu_client.deleted == ["om_restart_warning"]
+
+
 async def test_recall_schedule_clamps_the_delay_and_requires_a_message_id(client):
     """A caller may not pin a deletion far into the future, and an empty id is a client error."""
     test_client, feishu_client = client
