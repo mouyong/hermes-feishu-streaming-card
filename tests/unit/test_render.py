@@ -1645,14 +1645,14 @@ def test_subscription_usage_alone_keeps_the_footer_line():
     assert "5h 26% · weekly 89%" in footer["content"]
 
 
-def test_body_reasoning_reads_chronologically_while_the_panel_reads_newest_first():
-    """正文的思考按发生顺序读；折叠面板仍最新在前。
+def test_body_reasoning_and_the_panel_both_read_chronologically():
+    """正文的思考与折叠面板都按发生顺序读。
 
-    Maintainer note (contract change): the newest-first flip was applied to EVERY timeline entry,
-    so the reasoning blocks rendered into the CARD BODY came out bottom-up ("思考 3" above "思考 1")
-    while the panel below them read top-down. The user asked for the body to be chronological
-    ("正文的思考应该正序") and for the panel to stay newest-first ("Timeline 最好倒序一下"). One pass
-    now yields both orders: reasoning keeps its recorded order, panel-only entries are reversed.
+    Maintainer note (contract change): the newest-first flip once applied to every timeline entry, so
+    the reasoning blocks in the CARD BODY came out bottom-up ("思考 3" above "思考 1") while the panel
+    read top-down. The body was then restored to chronological ("正文的思考应该正序") and the panel
+    asked for the same later (「Timeline 的工具正序一下」). Both surfaces are chronological now, and
+    the body's thinking still stays out of the collapsed panel so it is not read twice.
     """
     from hermes_feishu_card.card_timeline import TimelineEntry
 
@@ -1684,7 +1684,7 @@ def test_body_reasoning_reads_chronologically_while_the_panel_reads_newest_first
     panel = next(item for item in elements if item.get("tag") == "collapsible_panel")
     panel_text = " ".join(item.get("content", "") for item in panel["elements"])
     assert "第1段" not in panel_text  # body thinking stays out of the collapsed panel
-    assert panel_text.index("web_search") < panel_text.index("terminal")
+    assert panel_text.index("terminal") < panel_text.index("web_search")
 
 
 def test_render_completed_card_footer_uses_compact_metrics_format():
@@ -2204,9 +2204,9 @@ def test_render_tool_timeline_uses_compact_semantic_event_rows():
         for item in timeline["elements"]
         if str(item.get("element_id", "")).startswith("auxiliary_timeline_toolentry_")
     ]
-    # Newest first (see test_render_timeline_reads_newest_first): the row for the LAST event leads, so
-    # the unpack order is the reverse of the order the events were applied in.
-    failed, running, completed = (row["content"] for row in rows)
+    # Chronological (see test_render_timeline_reads_chronologically): rows come out in the order the
+    # events were applied, so the unpack order follows them directly.
+    completed, running, failed = (row["content"] for row in rows)
 
     assert completed.startswith('<font color="green">✓ **terminal** · #1 · 250ms</font>')
     assert '<font color="grey">　参数: ' in completed
@@ -2661,14 +2661,16 @@ def test_render_omits_redundant_tool_summary_when_timeline_is_visible():
     assert "思考过程" in str(card)
 
 
-def test_render_timeline_reads_newest_first():
-    """The 思考过程 panel is ordered newest → oldest, so the latest work is read first.
+def test_render_timeline_reads_chronologically():
+    """The 思考过程 panel is ordered oldest → newest, matching how the turn happened.
 
-    Maintainer note (contract change): the panel used to be chronological (oldest first). Because the
-    panel sits at the BOTTOM of a card that is read downward, the entry the reader most wants ("what
-    is happening now?") was the furthest from their eye — the user asked for reverse order
-    ("Timeline 最好倒序一下 阅读上能够看最近的比较方便"). Selection is unchanged: the same entries are
-    shown, only the order they are written in flips.
+    Maintainer note (contract change): this was briefly reversed ("Timeline 最好倒序一下 阅读上能够看
+    最近的比较方便") so the latest work sat nearest the reader's eye. The user then asked for it back
+    (「Timeline 的工具正序一下」): a panel that reads top-to-bottom in the order things actually ran is
+    easier to follow than one you scan upward, and it now matches the body's reasoning entries, which
+    are chronological for the same reason (「正文的思考应该正序」).
+
+    Selection is unchanged — the same entries are shown, only the order they are written in.
     """
     from hermes_feishu_card.events import SidecarEvent
 
@@ -2698,10 +2700,10 @@ def test_render_timeline_reads_newest_first():
     )
     content = "".join(item["content"] for item in timeline["elements"])
 
-    newest = content.index("step_2")
-    middle = content.index("step_1")
     oldest = content.index("step_0")
-    assert newest < middle < oldest
+    middle = content.index("step_1")
+    newest = content.index("step_2")
+    assert oldest < middle < newest
 
 
 def test_render_timeline_folds_old_entries_before_answer():

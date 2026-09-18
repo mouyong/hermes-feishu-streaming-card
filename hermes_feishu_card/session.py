@@ -75,6 +75,15 @@ class ToolState:
     # Which tool call this is, 1-based, counted across the session. Rendered as #N so a card
     # showing one row out of many says WHICH call the reader is looking at.
     ordinal: int = 0
+    # How long the call took, in milliseconds — the number the CARD ROW prints next to #N.
+    #
+    # Maintainer note (contract change): the duration used to live only inside `detail` as a
+    # "耗时: 7.66s" line, so the content-area row showed it for a RUNNING tool (computed live from
+    # `started_at`) and then LOST it the moment the tool finished — the row the reader checks to see
+    # what a step cost was the one row without the number. The user asked exactly that
+    # (「正文中已完成的工具行是看不到执行时长吗」). Kept as its own field so the row can print it for
+    # every state; the detail line stays for the panel, which shows the full record.
+    duration_ms: float | None = None
 
 
 @dataclass
@@ -321,14 +330,16 @@ class CardSession:
             else:
                 started_at = previous_tool.started_at
             detail_data = event.data
+            resolved_duration_ms = _tool_duration_milliseconds(event.data)
             if (
                 is_terminal
-                and _tool_duration_milliseconds(event.data) is None
+                and resolved_duration_ms is None
                 and started_at is not None
                 and event.created_at >= started_at
             ):
                 detail_data = dict(event.data)
-                detail_data["duration_ms"] = (event.created_at - started_at) * 1000
+                resolved_duration_ms = (event.created_at - started_at) * 1000
+                detail_data["duration_ms"] = resolved_duration_ms
             resolved_detail = _tool_detail_from_event_data(detail_data)
             if (
                 is_terminal
@@ -371,6 +382,7 @@ class CardSession:
                 detail=resolved_detail,
                 started_at=started_at,
                 ordinal=call_ordinal,
+                duration_ms=resolved_duration_ms,
             )
             self.timeline.record_tool(tool_id, resolved_name, resolved_status, resolved_detail)
         elif event.event == "subagent.updated":
