@@ -104,24 +104,27 @@ def test_render_completed_card_omits_zero_tool_timeline():
     })
 
 
-def test_tool_activity_window_shows_the_current_step_and_the_one_before_it():
-    """Two rows, oldest first: the current step and the one it replaced.
+def test_completed_turn_can_hide_the_tool_rows_without_touching_the_panel():
+    """Issue #328: `show_completed_tool_activity: false` drops the rows only on a COMPLETED turn.
 
-    Maintainer note (contract): the content area used to render a single row, so the moment a tool
-    was replaced the reader lost the previous step entirely — the user's report was that on a
-    changeover they could not tell what the previous command had been
-    (「如果更换的时候 不知道上一条执行的是什么」). Running tools are never dropped to make room; the
-    window is backfilled from the most recent finished ones instead.
+    The content-area rows are gated on `pending_approval` alone — `show_reasoning` reaches only the
+    思考过程 panel — so a deployment that wants "answer + footer" on a finished card had no switch.
+    Contract, per the issue and the maintainer's reply: default true keeps today's behaviour; false
+    hides them once completed, leaves a running turn alone, and does NOT touch the panel or the
+    footer's 工具 #N count. A failed turn keeps its rows in both settings, because there they carry
+    the 已中断 pill naming where the run stopped.
     """
     from hermes_feishu_card.events import SidecarEvent
-    from hermes_feishu_card.render import (
-        _TOOL_ACTIVITY_WINDOW,
-        _render_tool_activity_elements,
-    )
+    from hermes_feishu_card.render import StatusConfig, render_card, resolve_display_status
 
-    def build(spec):
+    def build(status):
         session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
-        for sequence, (tool_id, status, created_at) in enumerate(spec, start=1):
+        tools = (
+            ("terminal-1", "completed", 1.0),
+            ("terminal-2", "completed", 2.0),
+            ("terminal-3", "running" if status == "running" else "completed", 3.0),
+        )
+        for sequence, (tool_id, tool_status, created_at) in enumerate(tools, start=1):
             session.apply(
                 SidecarEvent(
                     schema_version="1",
@@ -135,39 +138,108 @@ def test_tool_activity_window_shows_the_current_step_and_the_one_before_it():
                     data={
                         "tool_id": tool_id,
                         "name": "terminal",
-                        "status": status,
+                        "status": tool_status,
+                        "detail": "pytest -q",
+                    },
+                )
+            )
+        session.status = status
+        return session
+
+    def rows(card):
+        return [
+            item
+            for item in card["body"]["elements"]
+            if str(item.get("element_id", "")).startswith("tool_activity_")
+        ]
+
+    def render(status, flag):
+        session = build(status)
+        resolved = resolve_display_status(session, StatusConfig.defaults()).value
+        # A finished turn resolves to its own status; a live one resolves to a live phase
+        # (thinking / waiting), never to completed/failed.
+        if status in {"completed", "failed"}:
+            assert resolved == status
+        else:
+            assert resolved not in {"completed", "failed"}
+        return render_card(session, show_completed_tool_activity=flag)
+
+    assert rows(render("completed", True))
+    assert rows(render("completed", False)) == []
+
+    # A running turn is unaffected — this is the live progress line, and the panel is not up yet.
+    assert len(rows(render("running", False))) == len(rows(render("running", True)))
+
+    # A failed turn keeps its rows: the 已中断 pill names where the run stopped.
+    assert len(rows(render("failed", False))) == len(rows(render("failed", True)))
+
+
+def test_tool_activity_keeps_every_running_tool_with_its_own_predecessor():
+    """The live window is 「每个执行中的 + 它自己的前一条」, not a count.
+
+    Maintainer note (contract change): this replaces a "last two tools" window. The user's rule
+    (verbatim): 「不是执行中最靠前的那一条 而是执行中的前一条。例如，13 在执行中，那么 13 的前一条是 12，
+    要保留。例如，16 在执行中，那么 16 的前一条是 15，16 和 15 一起保留。13、22 都在执行中，那么 12、13
+    保留，19、20 保留」, extended by 「如果 13、16、20 都在跑的时候，那么它们都是应该保留的」.
+
+    Two earlier shapes were wrong and this test pins the difference:
+    - a COUNT-based window (`last N`) dropped members of a parallel batch, so four concurrent
+      commands rendered as one;
+    - a single window anchored on the EARLIEST running tool swallowed the gap between two separate
+      live steps (13 and 20 both running produced everything from 12 through 20).
+    Ordering is by `ordinal` for a measured reason: `session.py` records `started_at` only while a
+    tool is running, so sorting by it pulled terminal tools to the front and #13's "predecessor"
+    resolved to #20.
+    """
+    from hermes_feishu_card.events import SidecarEvent
+    from hermes_feishu_card.render import _render_tool_activity_elements
+
+    def build(total, running_set):
+        session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+        for position in range(1, total + 1):
+            session.apply(
+                SidecarEvent(
+                    schema_version="1",
+                    event="tool.updated",
+                    conversation_id="chat-1",
+                    message_id="msg-1",
+                    chat_id="oc_abc",
+                    platform="feishu",
+                    sequence=position,
+                    created_at=float(position),
+                    data={
+                        "tool_id": "terminal-%d" % position,
+                        "name": "terminal",
+                        "status": "running" if position in running_set else "completed",
                         "detail": "pytest -q",
                     },
                 )
             )
         return session
 
-    assert _TOOL_ACTIVITY_WINDOW == 2
-
-    rows = _render_tool_activity_elements(
-        build(
-            (
-                ("terminal-1", "completed", 1.0),
-                ("terminal-2", "completed", 2.0),
-                ("terminal-3", "running", 3.0),
-            )
-        ),
-        display_status="running",
-    )
-
-    assert [row["element_id"] for row in rows] == ["tool_activity_0", "tool_activity_1"]
-    # Oldest first, newest last — and the newest is the running one.
-    assert "#2" in rows[0]["content"]
-    assert "执行中" not in rows[0]["content"]
-    assert "#3" in rows[1]["content"]
-    assert "执行中" in rows[1]["content"]
-
-    # The window is a ceiling, not a quota: one tool still renders one row.
-    assert len(
-        _render_tool_activity_elements(
-            build((("terminal-1", "completed", 1.0),)), display_status="completed"
+    def shown(total, running_set, display_status="running"):
+        rows = _render_tool_activity_elements(
+            build(total, running_set), display_status=display_status
         )
-    ) == 1
+        ordered = []
+        for row in rows:
+            first_line = row["content"].splitlines()[0]
+            ordered.append("#" + first_line.split("#")[1].split(" ")[0].rstrip("·").strip())
+        return ordered
+
+    assert shown(20, {13}) == ["#12", "#13"]
+    assert shown(20, {16}) == ["#15", "#16"]
+    assert shown(22, {13, 20}) == ["#12", "#13", "#19", "#20"]
+    assert shown(20, {13, 16}) == ["#12", "#13", "#15", "#16"]
+    assert shown(20, {13, 16, 20}) == ["#12", "#13", "#15", "#16", "#19", "#20"]
+    # A whole parallel batch: every member stays, and one predecessor in front of the batch.
+    assert shown(20, {13, 14, 15, 16}) == ["#12", "#13", "#14", "#15", "#16"]
+    # The first tool of a session has no predecessor to pair with.
+    assert shown(3, {1}) == ["#1"]
+
+    # Nothing running (turn over): the last two steps stay, so a changeover is still readable.
+    assert shown(20, set(), display_status="completed") == ["#19", "#20"]
+
 
 
 def test_running_tool_without_model_text_removes_loading_placeholder_from_body():

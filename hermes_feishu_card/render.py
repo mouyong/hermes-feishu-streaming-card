@@ -119,6 +119,7 @@ def render_card(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
+    show_completed_tool_activity: bool = True,
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -137,6 +138,7 @@ def render_card(
         mentions_enabled=mentions_enabled,
         reasoning_format=reasoning_format,
         completion_mention=completion_mention,
+        show_completed_tool_activity=show_completed_tool_activity,
     ).card
 
 
@@ -157,6 +159,7 @@ def render_card_result(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
+    show_completed_tool_activity: bool = True,
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(session)
     table_overflow = transform_table_overflow(
@@ -180,6 +183,7 @@ def render_card_result(
         mentions_enabled=mentions_enabled,
         reasoning_format=reasoning_format,
         completion_mention=completion_mention,
+        show_completed_tool_activity=show_completed_tool_activity,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -223,6 +227,7 @@ def _render_card_unchecked(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
+    show_completed_tool_activity: bool = True,
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -303,9 +308,23 @@ def _render_card_unchecked(
                 used_roles=used_text_size_roles,
             ),
         )
+    # `card.show_completed_tool_activity` (default true = today's behaviour) decides whether a
+    # FINISHED turn keeps the content-area tool rows. While a turn runs they are the live progress
+    # line and the 思考过程 panel below does not exist yet; once it is done they restate entries that
+    # panel already holds — the reader wants the answer, and can open the panel for the process.
+    # Requested in issue #328, where `show_reasoning: false` turned out not to reach this block: the
+    # panel is gated on `show_reasoning` (a few lines below), these rows on `pending_approval` alone.
+    #
+    # Deliberately NOT applied to a FAILED turn: there the rows carry the 已中断 pill, i.e. WHERE the
+    # run stopped — the one thing a reader opens a failed card for (see _interrupted_tool_pill's
+    # rationale). Hiding a stopped run's last step would delete the diagnostic, not the noise.
+    hide_completed_rows = (
+        not show_completed_tool_activity
+        and (display_status == "completed" or session.status == "completed")
+    )
     tool_activity_elements = (
         []
-        if pending_approval
+        if pending_approval or hide_completed_rows
         else _render_tool_activity_elements(
             session,
             text_sizes=text_sizes,
@@ -1596,21 +1615,41 @@ def _render_tool_activity_elements(
     running = [
         tool for tool in session.tools.values() if turn_is_live and _tool_is_running(tool)
     ]
-    # Start order, oldest first, so the rows read top-to-bottom like the run did. The sort is stable,
-    # so tools that never reported a start time keep their insertion order.
-    ordered = sorted(session.tools.values(), key=lambda tool: tool.started_at or 0.0)
+    # Start order, oldest first, so the rows read top-to-bottom like the run did.
+    #
+    # Ordered by `ordinal`, NOT by `started_at`: session.py only records a start time for a tool that
+    # is still running (`started_at = None if is_terminal`), so a tool whose first event was already
+    # terminal sorts to the FRONT — "the row before this one" then resolved to an unrelated late tool
+    # (measured: with #13 running, its predecessor came back as #20). `ordinal` is the session-wide
+    # call counter and is exactly the #N the card prints, so it is both the correct and the stable key.
+    ordered = sorted(session.tools.values(), key=lambda tool: tool.ordinal or 0)
     if running:
         running.sort(key=lambda tool: tool.started_at or 0.0)
-        # Every running tool stays visible; the window is then backfilled from the most recent
-        # finished tools, because the row that matters most on a changeover is the one BEFORE the
-        # current step.
-        shown = {id(tool) for tool in running}
-        for tool in reversed(ordered):
-            if len(shown) >= _TOOL_ACTIVITY_WINDOW:
-                break
-            shown.add(id(tool))
-        selected = [tool for tool in ordered if id(tool) in shown]
+        # Maintainer note (contract change): EVERY running tool keeps its OWN predecessor, rather
+        # than one window measured from the earliest running tool.
+        #
+        # The user's rule, verbatim: 「不是执行中最靠前的那一条 而是执行中的前一条。例如，13 在执行中，
+        # 那么 13 的前一条是 12，要保留。例如，16 在执行中，那么 16 的前一条是 15，16 和 15 一起保留。
+        # 13、22 都在执行中，那么 12、13 保留，19、20 保留」.
+        #
+        # Why the earlier shapes were wrong: a count-based window (`last N tools`) dropped members of a
+        # parallel batch, and a single window anchored on the EARLIEST running tool still swallowed the
+        # gap between two separate live steps — with 13 and 20 both running it produced everything from
+        # 12 through 20, burying 14…19 rows the reader never asked for. Pairing each running tool with
+        # the row from before it shows exactly the two facts a reader needs: what is running now, and
+        # what just finished before it.
+        keep_ids = set()
+        for tool in running:
+            keep_ids.add(id(tool))
+            position = next(
+                index for index, candidate in enumerate(ordered) if candidate is tool
+            )
+            if position > 0:
+                keep_ids.add(id(ordered[position - 1]))
+        selected = [tool for tool in ordered if id(tool) in keep_ids]
     else:
+        # Nothing is running: a finished card keeps the last two steps so a changeover is still
+        # readable after the turn ends (same rule the user gave for the live case).
         selected = ordered[-_TOOL_ACTIVITY_WINDOW:]
     now = _time.time()
     text_size = _role_text_size(
