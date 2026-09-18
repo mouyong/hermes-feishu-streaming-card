@@ -9829,6 +9829,43 @@ async def supersede_restart_group_async(source: Any, chat_id: str) -> int:
         return 0
 
 
+def interrupted_turn_locals(source: Any, message_id: str, result: Any) -> dict[str, Any]:
+    """Locals for the ``message.failed`` that records a user interruption — metrics included.
+
+    Built here rather than inline in the installed patch block so it is unit-testable: the block is
+    generated source, and the previous shape emitted the error text ALONE. The card then drew
+    「已停止」 · 工具 #1 · 0s · Unknown — the duration and model were never sent, not merely unread —
+    while the sibling path (a queued follow-up ending in a failure) had already been fixed to carry
+    them. A reader looking at an interrupted card most wants to know how far it got, so both paths
+    now send the same envelope.
+
+    Absent or unusable values are simply omitted: the session keeps what it already has instead of
+    overwriting a real measurement with a placeholder.
+    """
+    locals_: dict[str, Any] = {
+        "source": source,
+        "chat_id": getattr(source, "chat_id", None),
+        "message_id": message_id,
+        "error": "用户已打断当前任务",
+    }
+    if not isinstance(result, dict):
+        return locals_
+    metrics: dict[str, Any] = {
+        "duration": result.get("_hfc_turn_seconds"),
+        "model": result.get("model", ""),
+        "tokens": {
+            "input_tokens": result.get("input_tokens", 0),
+            "output_tokens": result.get("output_tokens", 0),
+        },
+        "context": {
+            "used_tokens": result.get("last_prompt_tokens", 0),
+            "max_tokens": result.get("context_length", 0),
+        },
+    }
+    locals_.update(metrics)
+    return locals_
+
+
 async def schedule_message_recall_async(
     message_id: str,
     *,
@@ -10772,6 +10809,20 @@ def _event_data(
     if event_name == "message.failed":
         error = _first_string(local_vars, ("error", "exception")) or "消息处理失败"
         data["error"] = error
+        # Maintainer note (contract change): a failure envelope used to carry ONLY its error text, so
+        # a stopped card's footer drew 「已停止」 · 工具 #1 · 0s · Unknown — the metrics were never sent.
+        # A failed/interrupted turn is exactly when the reader wants to know how far it got (the same
+        # reason the card keeps its tool rows on this state), so the envelope now carries the four
+        # fields `message.completed` does. Senders that know nothing extra simply omit them.
+        answer = _completion_answer(local_vars)
+        data.update(
+            {
+                "duration": _completion_duration(local_vars),
+                "model": _completion_model(local_vars),
+                "tokens": _completion_tokens(local_vars, answer),
+                "context": _completion_context(local_vars),
+            }
+        )
         return data
     if event_name == "message.started":
         sender_open_id = _message_sender_open_id(

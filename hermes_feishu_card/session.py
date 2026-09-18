@@ -538,11 +538,42 @@ class CardSession:
             self.status = "failed"
             error = event.data.get("error")
             error = error if isinstance(error, str) and error.strip() else "消息处理失败"
+            self._adopt_failure_metrics(event.data)
             partial = self._adopt_in_progress_content()
             self.answer_text = partial + "\n\n> " + error if partial else error
         self.updated_at = time.time()
         self.refresh_display_status_source()
         return True
+
+    def _adopt_failure_metrics(self, data: Any) -> None:
+        """Keep whatever a FAILED envelope could measure, so a stopped card says where it stopped.
+
+        Maintainer note (contract change): the failure envelope carried only its error text, so an
+        interrupted card's footer drew 「已停止」 · 工具 #1 · 0s · Unknown — the numbers were never sent,
+        not merely unread. The reader's question about a stopped run is where it got to, and this is
+        the row that answers it.
+
+        Only usable values are adopted: an envelope from a sender that knows nothing extra (an older
+        shell, a failure with no turn behind it) must not overwrite what the session already measured
+        with a zero or a placeholder.
+        """
+        if not isinstance(data, dict):
+            return
+        model = data.get("model")
+        if isinstance(model, str) and model.strip():
+            self.model = model
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict) and tokens:
+            self.tokens = dict(tokens)
+        context = data.get("context")
+        if isinstance(context, dict) and context:
+            self.context = dict(context)
+        try:
+            duration = float(data.get("duration"))
+        except (TypeError, ValueError):
+            return
+        if duration > 0:
+            self.duration = duration
 
     def _adopt_in_progress_content(self) -> str:
         """Promote the content the user was reading, so a failure cannot erase it.

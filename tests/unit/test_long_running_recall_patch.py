@@ -218,6 +218,50 @@ async def test_plain_text_egress_clears_the_restart_group_behind_a_normal_messag
         SimpleNamespace(platform="feishu", chat_id="oc_home", thread_id="omt_x"), "oc_home") == 0
 
 
+def test_an_interrupted_turn_reports_its_metrics_not_just_its_error():
+    """A stopped turn sends duration/model/tokens/context, so its card can say where it stopped.
+
+    Regression: the interruption envelope carried the error text ALONE, so the card drew
+    「已停止」 · 工具 #1 · 0s · Unknown — the numbers were never sent, not merely unread — while the
+    sibling path (a queued follow-up ending in failure) already carried them. The reader's question
+    about a stopped run is where it got to.
+    """
+    result = {
+        "_hfc_turn_seconds": 42.5,
+        "model": "deepseek-flash",
+        "input_tokens": 1234,
+        "output_tokens": 567,
+        "last_prompt_tokens": 301_000,
+        "context_length": 1_000_000,
+    }
+    locals_ = hook_runtime.interrupted_turn_locals(
+        SimpleNamespace(platform="feishu", chat_id="oc_x"), "om_user", result
+    )
+
+    assert locals_["error"] == "用户已打断当前任务"
+    payload = hook_runtime.build_event("message.failed", dict(locals_))
+    data = payload["data"]
+    assert data["error"] == "用户已打断当前任务"
+    assert data["duration"] == 42.5
+    assert data["model"] == "deepseek-flash"
+    assert data["tokens"] == {"input_tokens": 1234, "output_tokens": 567}
+    assert data["context"] == {"used_tokens": 301_000, "max_tokens": 1_000_000}
+
+
+def test_an_interrupted_turn_without_a_result_still_sends_its_error():
+    """No result to measure → the envelope still reports the interruption, with no invented metrics.
+
+    The session keeps whatever it already measured rather than adopting a placeholder, so this must
+    NOT put zeros or "Unknown" into the payload.
+    """
+    locals_ = hook_runtime.interrupted_turn_locals(
+        SimpleNamespace(platform="feishu", chat_id="oc_x"), "om_user", None
+    )
+    assert locals_["error"] == "用户已打断当前任务"
+    assert "duration" not in locals_
+    assert "model" not in locals_
+
+
 def test_only_the_restart_family_is_treated_as_self_retiring():
     """The restart pair retires itself; nothing else is caught by the prefix check.
 
