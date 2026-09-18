@@ -110,6 +110,20 @@ BUSY_STEER_ACK_RECALL_SECONDS = 15.0
 # each line lives for the recall window instead of forever.
 STATUS_NOTICE_PREFIX = "⏳"
 STATUS_NOTICE_RECALL_SECONDS = 15.0
+# The approval-expiry family — the ⌛ receipts a user sees when they click an approval card too late
+# or when nobody answered in time:
+#   "⌛ That approval had already expired — the command was not run (it timed out or was resolved
+#    elsewhere)."  (plugins/platforms/feishu/adapter.py, `_resolve_approval`, sent when the click
+#    reached an approval nothing was waiting on)
+#   "⌛ Approval timed out after 5 minutes — the command was NOT run. Ask me to try again …"
+#    (gateway/platforms/base_exec_approval.py, posted by the runner's settle path)
+# Both are one-shot receipts about a decision that is already over: the agent is no longer blocked,
+# nothing will act on the answer, and the user's own words for why they should not linger are
+# 「如果用户点了审批的交互，那么应该撤销 … 让会话流干净一点」. On Feishu these are the ONLY two ⌛
+# strings (verified across gateway/, tools/, agent/, plugins/), so the emoji is a safe prefix — every
+# other platform's ⌛ wording never reaches a Feishu send.
+APPROVAL_EXPIRED_NOTICE_PREFIX = "⌛"
+APPROVAL_EXPIRED_NOTICE_RECALL_SECONDS = 15.0
 # (text prefix, seconds to wait before withdrawing) — every transient notice hfc withdraws after the
 # user has had a chance to read it. Content the user still needs (steer / queued acks, provider-
 # failure replies) is deliberately absent: only self-erasing status pings belong here.
@@ -118,6 +132,7 @@ TRANSIENT_THREAD_NOTICES: tuple[tuple[str, float], ...] = (
     (BUSY_INTERRUPT_ACK_PREFIX, BUSY_INTERRUPT_ACK_RECALL_SECONDS),
     (BUSY_STEER_ACK_PREFIX, BUSY_STEER_ACK_RECALL_SECONDS),
     (STATUS_NOTICE_PREFIX, STATUS_NOTICE_RECALL_SECONDS),
+    (APPROVAL_EXPIRED_NOTICE_PREFIX, APPROVAL_EXPIRED_NOTICE_RECALL_SECONDS),
 )
 DEFAULT_TIMEOUT_SECONDS = 0.8
 INTERACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
