@@ -237,8 +237,14 @@ def test_mobile_approval_explains_expand_before_full_scope_and_consent():
     assert '展开仅查看内容，不会提交授权' in card['elements'][0]['content']
     assert 'echo review-scope' in str(card)
     scope_index = next(i for i,e in enumerate(card['elements']) if 'echo review-scope' in str(e))
-    action_index = next(i for i,e in enumerate(card['elements']) if e['tag'] == 'action')
-    assert scope_index < action_index
+    # The options moved out of the legacy ``action`` container into a ``column_set`` of auto-width
+    # columns so they render compact («能否用小按钮而不是长按钮»); locate them by the click payload they
+    # carry rather than by the container tag.
+    button_index = next(
+        i for i, element in enumerate(card['elements'])
+        if 'interaction.select' in str(element)
+    )
+    assert scope_index < button_index
 
 
 # ---------------------------------------------------------------------------

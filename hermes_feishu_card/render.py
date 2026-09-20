@@ -650,8 +650,8 @@ def _render_legacy_callback_card(
             )
             for index, option in enumerate(interaction.options)
         ]
-        for offset in range(0, len(buttons), 5):
-            elements.append({"tag": "action", "actions": buttons[offset : offset + 5]})
+        for row in _legacy_choice_button_rows(buttons):
+            elements.append(row)
         if interaction.allow_custom_input:
             elements.append(
                 _legacy_form(_render_other_form(interaction, profile_id=profile_id))
@@ -671,11 +671,59 @@ def _render_legacy_callback_card(
 
 
 def _legacy_button(button: Mapping[str, Any]) -> Dict[str, Any]:
+    # ``width`` is KEPT. Dropping it made the client fall back to stretching every option across the
+    # full row, so a four-option approval read as four full-width bars — the user asked for compact
+    # buttons («能否用小按钮而不是长按钮»), and ``width: "default"`` is the documented way to ask for
+    # an auto-width button. ``element_id``/``behaviors`` still go: the first is unused here and the
+    # second is the CardKit v2 client-side callback, which never reaches ``p2.card.action.trigger``
+    # (the button's top-level ``value`` is what carries the click).
     return {
         key: value
         for key, value in button.items()
-        if key not in {"element_id", "size", "width", "behaviors"}
+        if key not in {"element_id", "size", "behaviors"}
     }
+
+
+# How many choice buttons share one row. Four keeps the common approval (允许一次 / 本会话允许 /
+# 始终允许 / 拒绝) on a single line of small buttons on a phone; a longer list wraps.
+_LEGACY_CHOICE_BUTTONS_PER_ROW = 4
+
+
+def _legacy_choice_button_rows(
+    buttons: list[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Lay choice buttons out as compact, left-aligned rows.
+
+    The legacy ``action`` container is what made the options look like long bars: on mobile each
+    button in it is stretched across the row. Feishu's own guidance for arranging buttons side by
+    side is a ``column_set`` of auto-width columns — and in card JSON 1.0 a button that is NESTED in
+    another component does not need the ``action`` container at all (only a root-level button does),
+    so the click still arrives through the button's own ``value``.
+
+    ``flex_mode: "flow"`` lets a longer option list wrap instead of being squeezed, and
+    ``horizontal_align: "left"`` keeps auto-width columns from being spread across the card.
+    """
+    rows: list[Dict[str, Any]] = []
+    for offset in range(0, len(buttons), _LEGACY_CHOICE_BUTTONS_PER_ROW):
+        chunk = buttons[offset : offset + _LEGACY_CHOICE_BUTTONS_PER_ROW]
+        rows.append(
+            {
+                "tag": "column_set",
+                "flex_mode": "flow",
+                "horizontal_spacing": "8px",
+                "horizontal_align": "left",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "top",
+                        "elements": [button],
+                    }
+                    for button in chunk
+                ],
+            }
+        )
+    return rows
 
 
 def _legacy_form(form: Mapping[str, Any]) -> Dict[str, Any]:

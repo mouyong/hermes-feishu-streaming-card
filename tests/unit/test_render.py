@@ -12,6 +12,33 @@ import pytest
 import time
 
 
+def interaction_buttons(card):
+    """Every clickable option button on an interaction card, whatever container holds it.
+
+    Found by what the button DOES (the top-level ``value`` the click carries), never by the
+    container it sits in. The options moved from a legacy ``action`` container to a
+    ``column_set`` of auto-width columns so they render compact instead of as full-width bars
+    («能否用小按钮而不是长按钮»), and a container-shaped lookup reports that as a regression.
+    """
+    found = []
+
+    def walk(elements):
+        for element in elements or ():
+            if not isinstance(element, dict):
+                continue
+            if element.get("tag") == "button":
+                found.append(element)
+            for action in element.get("actions") or ():
+                if isinstance(action, dict) and action.get("tag") == "button":
+                    found.append(action)
+            for column in element.get("columns") or ():
+                if isinstance(column, dict):
+                    walk(column.get("elements"))
+
+    walk(card.get("elements") or card.get("body", {}).get("elements"))
+    return found
+
+
 def test_render_thinking_card_keeps_runtime_status_only_in_footer():
     from hermes_feishu_card.events import SidecarEvent
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
@@ -919,12 +946,7 @@ def test_render_pending_interaction_as_buttons():
     assert "schema" not in card
     assert "body" not in card
     assert card["config"] == {"wide_screen_mode": True, "update_multi": True}
-    action = next(
-        element
-        for element in card["elements"]
-        if element.get("tag") == "action"
-    )
-    buttons = action["actions"]
+    buttons = interaction_buttons(card)
     assert [item["text"]["content"] for item in buttons] == ["1", "2"]
     assert "behaviors" not in buttons[0]
     assert buttons[0]["value"]["hfc_action"] == "interaction.select"
@@ -2937,3 +2959,71 @@ def test_requester_mentions_preserve_existing_at_markup_and_plain_urls():
     session = CardSession('c', 'm', 'oc', sender_open_id='ou_requester', sender_name='牟勇')
     original = '<at id="ou_requester">@牟勇</at> https://example.com/@牟勇 `@牟勇'
     assert _render_known_requester_mentions(original, session) == original
+
+
+def _approval_session(options):
+    session = CardSession(conversation_id="c", message_id="m", chat_id="oc")
+    session.active_interaction = InteractionState(
+        interaction_id="approval-1",
+        kind="approval",
+        prompt="需要授权后继续执行",
+        description="**完整命令**\nrm -rf /tmp/demo",
+        allow_custom_input=False,
+        status="pending",
+        timeout_seconds=300.0,
+        options=[
+            InteractionOption(label=label, value=value) for label, value in options
+        ],
+    )
+    return session
+
+
+def test_pending_options_render_as_compact_button_columns():
+    """Options must be small buttons, not bars that each take a whole row.
+
+    The user's ask («能否用小按钮而不是长按钮»). The legacy ``action`` container stretched every option
+    across the row on mobile, so a four-option approval read as four full-width bars. The options
+    now sit in a ``column_set`` of auto-width columns — Feishu's documented way to lay buttons out
+    side by side — and each button asks for ``width: "default"`` (auto width), which the legacy
+    adapter used to strip before the card was sent.
+    """
+    session = _approval_session(
+        [("允许一次", "once"), ("本会话允许", "session"), ("始终允许", "always"), ("拒绝", "deny")]
+    )
+    card = render_legacy_interaction_callback_card(session)
+
+    assert not [
+        element for element in card["elements"] if element.get("tag") == "action"
+    ], "the stretching container must be gone"
+    rows = [element for element in card["elements"] if element.get("tag") == "column_set"]
+    assert len(rows) == 1, "four options share one row"
+    row = rows[0]
+    assert row["flex_mode"] == "flow"
+    assert row["horizontal_align"] == "left"
+    assert [column["width"] for column in row["columns"]] == ["auto"] * 4
+    buttons = [column["elements"][0] for column in row["columns"]]
+    assert [button["width"] for button in buttons] == ["default"] * 4
+    assert [button["text"]["content"] for button in buttons] == ["1", "2", "3", "4"]
+    # Nesting does not change the click: it still rides the button's own top-level ``value``, which
+    # is what the Feishu p2.card.action.trigger handler reads (a CardKit ``behaviors`` entry is the
+    # client-side callback and never reaches it).
+    assert [button["value"]["choice"] for button in buttons] == [
+        "once",
+        "session",
+        "always",
+        "deny",
+    ]
+    assert all(button["value"]["hfc_action"] == "interaction.select" for button in buttons)
+    assert all("behaviors" not in button for button in buttons)
+
+
+def test_a_longer_option_list_wraps_into_more_compact_rows():
+    """A list longer than one row wraps instead of being squeezed or stretched."""
+    session = _approval_session(
+        [(f"选项{index}", f"v{index}") for index in range(1, 7)]
+    )
+    card = render_legacy_interaction_callback_card(session)
+
+    rows = [element for element in card["elements"] if element.get("tag") == "column_set"]
+    assert [len(row["columns"]) for row in rows] == [4, 2]
+    assert len(interaction_buttons(card)) == 6
