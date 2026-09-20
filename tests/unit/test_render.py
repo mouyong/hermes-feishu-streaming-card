@@ -3077,3 +3077,48 @@ def test_the_panel_keeps_a_running_row_even_outside_the_size_window():
     assert "#25" in ids, ids
     assert "#24" in ids, ids
     assert "#45" in ids, ids  # the newest rows are still there
+
+
+def test_the_panel_overshoots_the_cap_rather_than_orphan_a_tool_row():
+    """A block whose tool count differs from its neighbours must not lose its thinking.
+
+    The size window is taken by POSITION, so with uneven blocks the oldest slot lands in the MIDDLE
+    of one block: its tool rows survive while the reasoning above them is dropped. The user chose to
+    let the panel exceed its cap rather than delete evidence
+    (「是不是突破13条，这样就能解决前面的问题」), and that is the right trade here — they have twice
+    reported tool rows MISSING from the panel. Overshoot is bounded by the single block straddling
+    the window's start, so exactly one row over the cap.
+    """
+    from hermes_feishu_card.render import (
+        _keep_recent_tools_after_each_reasoning,
+        _select_timeline_entries,
+    )
+
+    # Uneven blocks: 3,1,3,1,... — a plain position window slices the oldest one mid-block.
+    entries = []
+    block_of = {}
+    tool_no = 0
+    for block, count in enumerate([3, 1, 3, 1, 3, 1, 3, 1, 3], start=1):
+        entries.append(_timeline_entry("reasoning", title=f"思考{block}"))
+        block_of[len(entries) - 1] = block
+        for _ in range(count):
+            tool_no += 1
+            entries.append(_timeline_entry("tool", tool_id=f"#{tool_no}"))
+            block_of[len(entries) - 1] = block
+
+    windowed = _keep_recent_tools_after_each_reasoning(entries, per_reasoning=2)
+    kept = _select_timeline_entries(windowed, max_items=12)
+    kept_ids = {id(entry) for entry in kept}
+
+    orphaned_tools = [
+        block_of[index]
+        for index, entry in enumerate(entries)
+        if id(entry) in kept_ids
+        and entry.kind == "tool"
+        and block_of[index]
+        not in {block_of[i] for i, e in enumerate(entries) if id(e) in kept_ids and e.kind == "reasoning"}
+    ]
+
+    assert orphaned_tools == [], f"tool rows floating without their thinking: block(s) {orphaned_tools}"
+    assert len(kept) == 13, [e.title for e in kept]  # bounded overshoot: cap 12 → 13
+    assert len(kept) <= 12 + 1

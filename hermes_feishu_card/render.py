@@ -2416,6 +2416,33 @@ def _select_timeline_entries(entries: list[Any], *, max_items: int) -> list[Any]
         # running row can sit (the first assertion in
         # test_the_panel_keeps_a_running_row_even_outside_the_size_window caught this).
         selected_indexes = sorted(set(selected_indexes) | pinned)
+
+    # No tool row may float without the thinking it belongs to. The window is taken by POSITION, so
+    # when a block's tool count differs from its neighbours the oldest slot can land in the MIDDLE of
+    # a block — keeping its tool rows while dropping the reasoning above them. Extend BACKWARDS by the
+    # owning reasoning instead of trimming the tools, and accept the overshoot (12 → 13).
+    #
+    # The user picked this direction explicitly (「是不是突破13条，这样就能解决前面的问题」) and it is
+    # the right trade here: they have twice reported tool rows MISSING from the panel
+    # (「看不到『执行中』或『执行中』前面的内容，像这里看不到 24，25」), so dropping a row to hit a
+    # round number is the wrong fix. Overshoot is bounded: only the one block straddling the window's
+    # start can need an owner.
+    selected_set = set(selected_indexes)
+    owners_needed: set[int] = set()
+    nearest_reasoning: int | None = None
+    for index, entry in enumerate(entries):
+        if entry.kind == "reasoning":
+            nearest_reasoning = index
+        elif (
+            entry.kind == "tool"
+            and index in selected_set
+            and nearest_reasoning is not None
+            and nearest_reasoning not in selected_set
+        ):
+            owners_needed.add(nearest_reasoning)
+    if owners_needed:
+        selected_indexes = sorted(selected_set | owners_needed)
+
     return [entries[index] for index in selected_indexes]
 
 
