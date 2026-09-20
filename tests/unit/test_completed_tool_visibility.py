@@ -34,13 +34,20 @@ def test_terminal_tool_visibility_changes_only_content_tool_rows(status, reasoni
     if status == "completed":
         assert not tool_rows(hidden)
     else:
-        # Contract difference from upstream, on purpose: a FAILED turn keeps its rows, because they
-        # carry the 已中断 pill — WHERE the run stopped, the one thing a reader opens a failed card
-        # for. Upstream hides them here; this fork does not.
-        assert tool_rows(hidden)
+        # Contract change (v4.6.6): a finished turn now hides only the SUCCESSFUL rows, on completed and
+        # failed alike, so this completed fixture row goes in both cases — v4.6.6 moved the filtering
+        # into the renderer, where it keeps every non-successful row.
+        #
+        # What the fork actually insists on is unchanged and is stronger than "a failed turn keeps
+        # everything": a row that did NOT succeed must survive, because it carries the 已中断 pill —
+        # WHERE the run stopped, the one thing a reader opens a failed card for. That is pinned by
+        # `test_terminal_compaction_preserves_unsuccessful_tool_evidence` below (it runs for
+        # failed/error/cancelled/interrupted/running) and by upstream's own
+        # test_timeline_active_visibility::test_terminal_compaction_keeps_old_interrupted_body_tools_in_the_panel.
+        assert not tool_rows(hidden)
     assert hidden['header'] == shown['header']
     assert hidden['body']['elements'] == [
-        e for e in shown['body']['elements'] if e not in tool_rows(shown) or status == "failed"
+        e for e in shown['body']['elements'] if e not in tool_rows(shown)
     ]
     assert "工具 #1" in hidden["header"]["title"]["content"]
     assert 'fixture-tool' in session.tools
@@ -72,3 +79,14 @@ def test_switch_preserves_live_progress_and_default(monkeypatch):
     assert not tool_rows(render_card(session, hide_completed_tool_activity=True))
     session.tools.clear()
     assert render_card(session) == render_card(session, hide_completed_tool_activity=True)
+
+
+@pytest.mark.parametrize('status',['failed','error','cancelled','interrupted','running'])
+@pytest.mark.parametrize('flag',['hide_completed_tool_activity','hide_successful_tool_activity'])
+def test_terminal_compaction_preserves_unsuccessful_tool_evidence(status,flag):
+    session=session_with_tool()
+    session.tools['fixture-tool'].status=status
+    session.status='completed'
+    card=render_card(session,**{flag:True})
+    assert tool_rows(card)
+    assert '已完成' not in tool_rows(card)[0]['content']

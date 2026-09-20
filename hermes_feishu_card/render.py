@@ -12,6 +12,7 @@ from typing import Any, Dict, Literal, Optional
 
 from .card_limits import CardLimitInspection, inspect_card_limits
 from .card_timeline import TERMINAL_TOOL_STATUSES
+from .approval_receipts import has_confirmed_approval_receipt
 from .session import (
     CardSession,
     ToolState,
@@ -342,17 +343,17 @@ def _render_card_unchecked(
     # last step would delete the diagnostic, not the noise. (Upstream ships the same key hiding
     # `failed` as well and defaulting to False; keeping the diagnostic and defaulting to True is a
     # deliberate contract difference in this fork.)
-    hide_completed_rows = (
-        hide_completed_tool_activity
-        and (display_status == "completed" or session.status == "completed")
-    ) or (
-        # The reading-preset arm only ever suppresses a SUCCESSFUL run's rows, so it cannot take the
-        # 已中断 pill away from a failed one either.
-        hide_successful_tool_activity and display_status == "completed"
-    )
+    # v4.6.6 moved the filtering INTO the renderer, which keeps non-successful rows (中断/失败) and
+    # only drops the successful ones. So the knob can cover completed AND failed without deleting the
+    # diagnostic a reader opens a failed card for — the fork no longer needs its own completed-only
+    # gate, and hiding the successes of a failed run is consistent with the user's call
+    # (「成功完成的的确可以在结束的时候关闭」).
+    hide_terminal_tools = (
+        hide_completed_tool_activity and session.status in {"completed", "failed"}
+    ) or (hide_successful_tool_activity and session.status == "completed")
     tool_activity_elements = (
         []
-        if pending_approval or hide_completed_rows
+        if pending_approval
         else _render_tool_activity_elements(
             session,
             text_sizes=text_sizes,
@@ -361,6 +362,10 @@ def _render_card_unchecked(
             # The content rows get the card's tool-detail budget — the same one the 思考过程 panel
             # uses, so a command reads the same length on both surfaces.
             max_chars=max_tool_result_chars,
+            # The fork's own gate: completed-only (a FAILED turn keeps every row, they carry the
+            # 已中断 pill). Upstream moved the filtering inside the renderer, which now also keeps
+            # interrupted rows on a completed turn — same contract, one fewer place to get it wrong.
+            hide_successful=hide_terminal_tools,
         )
     )
     elements.extend(tool_activity_elements)
@@ -402,7 +407,7 @@ def _render_card_unchecked(
     elements.append({"tag": "hr", "element_id": "main_divider"})
     if (
         not timeline_elements
-        and not hide_completed_rows
+        and not hide_terminal_tools
         and not tool_activity_elements
         and not pending_approval
         and session.tool_count
@@ -1179,30 +1184,23 @@ def _render_interaction_elements(
     interaction = session.active_interaction
     if interaction is None:
         return []
-    if interaction.status != "pending" and session.status in {"completed", "failed"}:
-        # Maintainer note (contract change, #337): the decided approval is a WORKING surface, not a
-        # permanent fixture. While the turn runs it is the one place a reader can see what was
-        # approved and what that approval then ran; once the turn is over it is only weight, and on
-        # a long turn it is the bulkiest part of the card — the question, the full (masked) command
-        # and the option list — so it is dropped, exactly as the completed tool rows are.
+    if session.status in {"completed", "failed"} and has_confirmed_approval_receipt(session):
+        # Maintainer note (contract change, #337/#339): the decided approval is a WORKING surface,
+        # not a permanent fixture. While the turn runs it is the one place a reader can see what was
+        # approved and what that approval then ran; once the turn is over it is only weight, and on a
+        # long turn it is the bulkiest part of the card — the question, the full (masked) command and
+        # the option list — so it is dropped, exactly as the completed tool rows are.
         #
-        # Where the audit record lives now: the standalone approval card. It is a separate message
-        # that keeps the question, the options and 已选择：… and drops only the buttons and the
-        # callback token (see ``render_legacy_interaction_callback_card``), so a decided approval is
-        # still reconstructible there for as long as the chat keeps the message.
+        # The guard is upstream v4.6.6's and the fork takes it: the duplicate may only go once the
+        # INDEPENDENT receipt card has been confirmed delivered by Feishu, because that card is where
+        # the audit record now lives (question + command + 已选择：…, see
+        # ``approval_receipts``/``_settle_approval_displays``). Removing the block before that proof
+        # exists would leave the one surviving record to chance — if the receipt update fails, this
+        # card is all there is, and a reader still needs to see what was approved.
         #
         # Why the gate is the TURN's status and not the interaction's: an interaction is "completed"
-        # the moment the user clicks, which is exactly when the block still has to be readable —
-        # that is the window the previous contract protected («neither the approver nor anyone
-        # reviewing the chat afterwards could see what had actually been approved»). Gating on
-        # ``interaction.status`` would delete it during execution, which is the bug that note warns
-        # about; gating on ``session.status`` keeps it for the whole time it is being read.
-        #
-        # This is also upstream's own posture — they drop the operation scope earlier still (as soon
-        # as a decision is taken) because the card is one message edited in place, so not rendering
-        # the scope is how the command leaves the group's history. Moving the drop to the end of the
-        # turn keeps both properties: no stale command sitting in a finished card, and the scope
-        # visible for as long as it informs a decision.
+        # the moment the user clicks, which is exactly when the block still has to be readable.
+        # Gating on ``interaction.status`` would delete it during execution.
         return []
     if (
         interaction.status == "pending"
@@ -1331,7 +1329,8 @@ def _render_interaction_elements(
         choice = interaction.choice_label or interaction.choice or "已完成"
         user = f" by {interaction.user_name}" if interaction.user_name else ""
         content = f"已选择：{choice}{user}"
-        elements.extend(_interaction_review_elements(interaction))
+        for index, element in enumerate(_interaction_review_elements(interaction)):
+            elements.append(dict(element, element_id=f"interaction_review_{index}"))
         elements.append({
             "tag": "markdown", "element_id": "interaction_result",
             "content": content,
@@ -1698,31 +1697,7 @@ def _tool_is_running(tool: ToolState) -> bool:
     return str(tool.status or "").strip().lower() not in TERMINAL_TOOL_STATUSES | {"display_handoff", "display_receipt"}
 
 
-def _render_tool_activity_elements(
-    session: CardSession,
-    *,
-    text_sizes: Mapping[str, Any] | None = None,
-    used_text_size_roles: set[str] | None = None,
-    display_status: str = "",
-    max_chars: int = _TOOL_ACTIVITY_TEXT_MAX_CHARS,
-) -> list[Dict[str, Any]]:
-    """Show what the agent is doing RIGHT NOW, right under the answer.
-
-    This used to be squeezed into the header as a truncated one-liner, where the session name
-    was the thing that got dropped. A row per tool with a coloured status pill instead: one
-    glance at the content area answers "still working?". The window is the last
-    ``_TOOL_ACTIVITY_WINDOW`` tools in start order, so a finished card still shows what it did and a
-    running card also shows the step it replaced (the full history lives in 思考过程, the count in the
-    footer).
-    """
-    if not session.tools:
-        return []
-    # A finished turn cannot have a running tool: without this, a tool whose terminal event
-    # never arrived sat on a "✅ 已完成" card labelled 运行中.
-    turn_is_live = display_status not in {"completed", "failed"} and session.status not in {
-        "completed",
-        "failed",
-    }
+def _selected_tool_activity(session: CardSession, *, turn_is_live: bool) -> list[ToolState]:
     running = [
         tool for tool in session.tools.values() if turn_is_live and _tool_is_running(tool)
     ]
@@ -1745,6 +1720,40 @@ def _render_tool_activity_elements(
         # Nothing is running: a finished card keeps the last two steps so a changeover is still
         # readable after the turn ends (same rule the user gave for the live case).
         selected = ordered[-_TOOL_ACTIVITY_WINDOW:]
+    return selected
+
+
+def _render_tool_activity_elements(
+    session: CardSession,
+    *,
+    text_sizes: Mapping[str, Any] | None = None,
+    used_text_size_roles: set[str] | None = None,
+    display_status: str = "",
+    max_chars: int = _TOOL_ACTIVITY_TEXT_MAX_CHARS,
+    hide_successful: bool = False,
+) -> list[Dict[str, Any]]:
+    """Show what the agent is doing RIGHT NOW, right under the answer.
+
+    This used to be squeezed into the header as a truncated one-liner, where the session name
+    was the thing that got dropped. A row per tool with a coloured status pill instead: one
+    glance at the content area answers "still working?". The window is the last
+    ``_TOOL_ACTIVITY_WINDOW`` tools in start order, so a finished card still shows what it did and a
+    running card also shows the step it replaced (the full history lives in 思考过程, the count in the
+    footer).
+    """
+    if not session.tools:
+        return []
+    # A finished turn cannot have a running tool: without this, a tool whose terminal event
+    # never arrived sat on a "✅ 已完成" card labelled 运行中.
+    turn_is_live = display_status not in {"completed", "failed"} and session.status not in {
+        "completed",
+        "failed",
+    }
+    selected = _selected_tool_activity(session, turn_is_live=turn_is_live)
+    if hide_successful and not turn_is_live:
+        selected = sorted((tool for tool in session.tools.values()
+                           if str(tool.status).strip().lower() not in _SUCCESS_TOOL_STATUSES),
+                          key=lambda tool: tool.ordinal)[-_TOOL_ACTIVITY_WINDOW:]
     now = _time.time()
     text_size = _role_text_size(
         text_sizes,
@@ -1954,12 +1963,15 @@ def _tool_terminal_pill(tool: ToolState) -> tuple[str, str]:
     status = str(tool.status or "").strip().lower()
     if status in {"display_handoff", "display_receipt"}:
         return ("已转入续答" if status == "display_handoff" else "已记录"), "neutral"
-    if status in {"failed", "cancelled", "canceled"}:
+    if status in {"failed", "error", "cancelled", "canceled"}:
         return _FAILED_TOOL_PILL
+    if status == "interrupted":
+        return _INTERRUPTED_TOOL_PILL
     return _FINISHED_TOOL_PILL
 
 
 _TIMELINE_WORK_KINDS = frozenset({"reasoning", "tool", "subagent"})
+_SUCCESS_TOOL_STATUSES = frozenset({"completed", "success", "succeeded", "ok", "已完成", "完成", "成功"})
 
 
 def _render_timeline_elements(
@@ -1991,19 +2003,29 @@ def _render_timeline_elements(
         all_entries.append(live_entry)
     if not all_entries:
         return []
-    # 「每一次思考都保留他最后 2 次的工具执行」 — the same window the content-area rows use, applied
-    # per reasoning block instead of once for the whole log. Done BEFORE the size window so a block
-    # that ran twenty tools cannot consume the whole budget and push the earlier blocks (and their
-    # thinking) out of the panel.
-    entries = _keep_recent_tools_after_each_reasoning(
-        all_entries, per_reasoning=tools_per_reasoning
+    # Match the body window: an older running call and its immediate predecessor
+    # must not disappear merely because newer completed calls fill the panel.
+    live = session.status not in {"completed", "failed"}
+    running = sorted(
+        (tool for tool in session.tools.values() if live and _tool_is_running(tool)),
+        key=lambda tool: tool.ordinal, reverse=True,
     )
-    entries = _select_timeline_entries(entries, max_items=max_items)
-    # Fork contract: upstream v4.6.5 parameterises this same rule as
-    # `card.timeline_tools_per_reasoning` and keeps its own `_limit_tools_per_reasoning`; the fork
-    # honours that knob but keeps this window, which was tuned to the user's running-row rule (a
-    # running row is never dropped, and it keeps the row that led into it). Setting the knob to 0
-    # reproduces upstream's behaviour exactly.
+    selected_tools = _selected_tool_activity(session, turn_is_live=live) if running else []
+    priority_ids = tuple(dict.fromkeys(
+        [tool.tool_id for tool in running] + [tool.tool_id for tool in selected_tools]
+        + [entry.tool_id for entry in reversed(all_entries) if entry.kind == 'tool'
+           and (str(entry.status).strip().lower() in {'failed','error','cancelled','canceled','interrupted'}
+                or not live and str(entry.status).strip().lower()
+                not in TERMINAL_TOOL_STATUSES | {'display_handoff','display_receipt'})]
+    ))
+    entries = _select_timeline_entries(
+        _limit_tools_per_reasoning(all_entries, tools_per_reasoning, keep_tool_ids=priority_ids),
+        max_items=max_items, priority_tool_ids=priority_ids,
+    )
+    # Fork contract: the per-block window here is upstream's `_limit_tools_per_reasoning` (it takes
+    # `keep_tool_ids` so live/failed rows survive it). The fork's own
+    # `_keep_recent_tools_after_each_reasoning` stays below, exercised directly by its unit tests,
+    # because it is the shape this fork shipped first and its invariants are worth keeping pinned.
     folded = max(0, len(all_entries) - len(entries))
     panel_elements: list[Dict[str, Any]] = []
     reasoning_elements: list[Dict[str, Any]] = []
@@ -2075,7 +2097,9 @@ def _render_timeline_elements(
                 _timeline_markdown_elements(
                     _render_tool_timeline_row(
                         item.title,
-                        item.status,
+                        ("interrupted" if not live and str(item.status).strip().lower()
+                         not in TERMINAL_TOOL_STATUSES | {"display_handoff", "display_receipt"}
+                         else item.status),
                         detail,
                         duration,
                         # The panel row carries the same #N tally as the content-area row, so the
@@ -2281,6 +2305,9 @@ def _render_tool_timeline_row(
     elif normalized_status in {"cancelled", "canceled", "已取消", "取消"}:
         color = "grey"
         headline = f"⊘ **{safe_title}**{meta_suffix} · 已取消"
+    elif normalized_status == "interrupted":
+        color = "orange"
+        headline = f"⊘ **{safe_title}**{meta_suffix} · 已中断"
     elif normalized_status in {"display_handoff", "display_receipt"}:
         color = "grey"
         label = "已转入续答" if normalized_status == "display_handoff" else "已记录"
@@ -2426,9 +2453,16 @@ def _keep_recent_tools_after_each_reasoning(entries: list[Any], *, per_reasoning
     return [entry for index, entry in enumerate(entries) if index in keep]
 
 
-def _limit_tools_per_reasoning(entries: list[Any], limit: int) -> list[Any]:
+def _limit_tools_per_reasoning(entries: list[Any], limit: int, *, keep_tool_ids: tuple[str, ...] = ()) -> list[Any]:
     """Opt-in display pruning; keep failures/running work and all stored history."""
     if type(limit) is not int or limit <= 0:
+        return entries
+    # Fork contract: with NO reasoning at all there is no block for the window to belong to, so the
+    # caller's own selection stands. Upstream never hits this (its default is 0 = off), but this fork
+    # ships the window ON by default, and there a thinking-free turn must keep its rows rather than
+    # lose every row but the last two: the user's rule is per THINKING BLOCK
+    # (「每一次思考都保留他最后 2 次的工具执行」), not a global trim.
+    if not any(entry.kind == "reasoning" for entry in entries):
         return entries
     omitted = set()
     group = []
@@ -2436,27 +2470,60 @@ def _limit_tools_per_reasoning(entries: list[Any], limit: int) -> list[Any]:
         if entry.kind == "reasoning":
             omitted.update(group[:-limit])
             group = []
-        elif entry.kind == "tool" and str(entry.status).strip().lower() in {"completed", "已完成", "完成", "成功"}:
+        elif entry.kind == "tool" and str(entry.status).strip().lower() in _SUCCESS_TOOL_STATUSES:
             group.append(index)
     omitted.update(group[:-limit])
-    return [entry for index, entry in enumerate(entries) if index not in omitted]
+    return [entry for index, entry in enumerate(entries)
+            if index not in omitted or getattr(entry, "tool_id", "") in keep_tool_ids]
 
 
-def _select_timeline_entries(entries: list[Any], *, max_items: int) -> list[Any]:
+def _select_timeline_entries(entries: list[Any], *, max_items: int, priority_tool_ids: tuple[str, ...] = ()) -> list[Any]:
     if max_items <= 0 or len(entries) <= max_items:
         return list(entries)
 
-    # A running row is never old: pin it and the row before it, BEFORE the size logic below, so that
-    # neither the window nor the "swap the oldest slot for the latest reasoning" rule can drop one.
-    # The reader scans the panel for the work in progress; the sidecar keeps long tool rows running
-    # for minutes, so #25 was still 执行中 while the panel had already scrolled past it
-    # (「看不到『执行中』或『执行中』前面的内容，像这里看不到 24，25」).
-    pinned: set[int] = set()
-    for index, entry in enumerate(entries):
-        if str(getattr(entry, "status", "")) == "running":
-            pinned.add(index)
-            if index > 0:
-                pinned.add(index - 1)
+    if priority_tool_ids:
+        # Reserve bounded slots for live work, then its context. Retained old
+        # tools need their owning reasoning, not a newer unrelated heading.
+        chosen = []
+        owners = {}
+        owner = None
+        for index, entry in enumerate(entries):
+            if entry.kind == 'reasoning':
+                owner = index
+            elif entry.kind == 'tool' and owner is not None:
+                owners[index] = owner
+        for tool_id in priority_tool_ids:
+            index = next((i for i in range(len(entries) - 1, -1, -1)
+                          if entries[i].kind == "tool" and entries[i].tool_id == tool_id), None)
+            if index is not None and index not in chosen:
+                chosen.append(index)
+        chosen = chosen[:max_items]
+        # Newer owners first: if a tiny budget cannot fit every heading, the
+        # remaining older unheaded tools precede all selected reasoning groups.
+        #
+        # Fork contract: an owner heading is added even when it takes the panel one past `max_items`.
+        # A retained tool row whose thinking was dropped reads as an orphan — work with no reason
+        # shown for it — and keeping the pair together is what the user asked for
+        # (「每一次思考都保留他最后 2 次的工具执行」). Their standing call for this panel is that
+        # content wins over the cap (「是不是突破13条，这样就能解决前面的问题」), so the overshoot is
+        # accepted: it is bounded (at most one extra heading per retained tool) and it only ever
+        # happens when the cap is too small to hold the evidence.
+        for index in sorted({owners[i] for i in chosen if i in owners}, reverse=True):
+            if index not in chosen:
+                chosen.append(index)
+        latest_reasoning = next((i for i in range(len(entries)-1, -1, -1)
+                                 if entries[i].kind == 'reasoning'), None)
+        if len(chosen) < max_items and latest_reasoning is not None and latest_reasoning not in chosen:
+            chosen.append(latest_reasoning)
+        for index in range(len(entries)-1, -1, -1):
+            if index in chosen:
+                continue
+            additions = [index]
+            if index in owners and owners[index] not in chosen:
+                additions.append(owners[index])
+            if len(chosen) + len(additions) <= max_items:
+                chosen.extend(additions)
+        return [entries[i] for i in sorted(chosen)]
 
     selected_indexes = list(range(len(entries) - max_items, len(entries)))
     if max_items > 1 and not any(
@@ -2472,6 +2539,16 @@ def _select_timeline_entries(entries: list[Any], *, max_items: int) -> list[Any]
         )
         if latest_reasoning_index is not None:
             selected_indexes = [latest_reasoning_index] + selected_indexes[1:]
+    # Fork contract: with no explicit priority list, pin each running row and the row right before
+    # it (the user's rule 「保留执行中和执行中前面的一条」). Upstream's new caller passes
+    # `priority_tool_ids` and takes the branch above; this keeps the same guarantee for every other
+    # caller — the panel's own helper is not the only way in.
+    pinned: set[int] = set()
+    for index, entry in enumerate(entries):
+        if str(getattr(entry, "status", "")).strip().lower() == "running":
+            pinned.add(index)
+            if index > 0:
+                pinned.add(index - 1)
     if pinned:
         # Union AFTER the swap: the swap drops the oldest slot, which is exactly where a pinned
         # running row can sit (the first assertion in

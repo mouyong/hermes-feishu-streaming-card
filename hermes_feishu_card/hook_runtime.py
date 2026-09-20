@@ -3263,7 +3263,7 @@ def request_interaction_from_hermes_locals(
             # was lost (connection dropped mid-flight). Falling straight back to
             # native text then produces a duplicate: the card was already sent
             # AND a numbered-list text appears. Ask the sidecar before giving up.
-            if _hfc_interaction_card_confirmed(config, interaction_id):
+            if _wait_for_interaction_card_confirmation(config, interaction_id):
                 _hfc_warn(
                     "interaction card confirmed present after POST failure: "
                     f"{_hfc_log_reference('interaction', interaction_id)}"
@@ -6583,6 +6583,10 @@ async def _hfc_send_with_native_command_result_card(
     # card policy ACCEPTS the chat. When it declines, the wrapper used to hand the core's text
     # straight to ``original`` — bare U+267B, monochrome, and on no recall path at all. Placed here,
     # every path that reaches this wrapper gets the coloured line and its withdrawal.
+    #
+    # Fork contract: upstream v4.6.6 routes notices through ``notice_for_send`` (which also returns the
+    # content it wants sent). This branch stays IN FRONT of it and returns early, because the fork has
+    # to own this line on paths the router does not reach — and it must still be the coloured text.
     restart_online = _hfc_restart_notice_rewrite(content)
     if restart_online is not None and callable(original):
         result = await original(
@@ -6594,14 +6598,17 @@ async def _hfc_send_with_native_command_result_card(
             generated_restart_notice=True,
         )
         return result
-    from .notice_producers import notice_route_for_send
-    notice_route = notice_route_for_send(self, chat_id, content, metadata)
-    if notice_route is not None and callable(original):
-        result = await original(self, chat_id, content, reply_to=reply_to, metadata=metadata)
+    from .notice_producers import notice_for_send
+    try:
+        notice = notice_for_send(self, chat_id, content, metadata)
+    except Exception:
+        notice = None
+    if notice is not None and callable(original):
+        result = await original(self, chat_id, notice['content'], reply_to=reply_to, metadata=metadata)
         if getattr(result, "success", False) is True:
             await schedule_message_recall_async(
                 str(getattr(result, "message_id", "") or ""),
-                route=notice_route, notice_family="restart",
+                route=notice['route'], notice_family=notice['family'],
             )
         return result
     handoff_context = _native_handoff_for_send(self, chat_id, content, metadata)
@@ -9651,6 +9658,8 @@ def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) 
                 adapter_ready = True
 
             current_send = adapter_type.__dict__.get("send")
+            from .notice_producers import install_adapter_notice_producers
+            install_adapter_notice_producers(adapter, runner)
             if current_send is _hfc_send_with_native_command_result_card:
                 setattr(adapter_type, "_hfc_command_result_send_wrapped", True)
                 adapter_ready = True
@@ -9852,7 +9861,7 @@ def _post_interaction_event(
 
 
 def _hfc_interaction_card_confirmed(
-    config: RuntimeConfig, interaction_id: str
+    config: RuntimeConfig, interaction_id: str, *, timeout_seconds: float | None = None
 ) -> bool:
     """Return True when the sidecar already tracks the interaction (card sent).
 
@@ -9863,7 +9872,7 @@ def _hfc_interaction_card_confirmed(
     try:
         base_url = _summary_base_url(config.event_url)
         url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
-        result = _get_json_sync(url, config.timeout_seconds)
+        result = _get_json_sync(url, config.timeout_seconds if timeout_seconds is None else timeout_seconds)
         return isinstance(result, dict) and result.get("status") in (
             "pending",
             "paused",
@@ -9872,6 +9881,32 @@ def _hfc_interaction_card_confirmed(
         )
     except Exception:
         return False
+
+
+def _wait_for_interaction_card_confirmation(
+    config: RuntimeConfig, interaction_id: str, *, grace_seconds: float = 3.0
+) -> bool:
+    """Boundedly confirm a card after an ambiguous event POST.
+
+    The sidecar may have accepted and started the Feishu send while the POST
+    response timed out. Do not replay the event; poll the read-only interaction
+    endpoint briefly so native text fallback is used only when no card exists.
+    """
+    deadline = time.monotonic() + max(0.0, min(float(grace_seconds), 5.0))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # The read itself consumes the grace budget. A slow lookup must not add
+        # a full configured timeout after the deadline has already expired.
+        if _hfc_interaction_card_confirmed(
+            config, interaction_id, timeout_seconds=min(config.timeout_seconds, remaining)
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
 
 
 def _timeout_for_event(config: RuntimeConfig, event_name: str) -> float:
