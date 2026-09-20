@@ -18,6 +18,7 @@ class Client:
     def __init__(self):
         self.sent = []
         self.updated = []
+        self.cross_dialect = []
         self.fail = False
 
     async def send_card(self, chat_id, card, **kwargs):
@@ -29,6 +30,8 @@ class Client:
 
     async def update_card_message(self, mid, card):
         original = next(c for m, c, _ in self.sent if m == mid)
+        if original.get("schema") != card.get("schema"):
+            self.cross_dialect.append(mid)
         assert original.get("schema") == card.get("schema"), "cross-dialect PATCH"
         self.updated.append((mid, copy.deepcopy(card)))
 
@@ -242,63 +245,87 @@ async def test_second_question_failure_updates_its_receipt_and_keeps_answer(mode
 
 
 @pytest.mark.asyncio
-async def test_the_card_a_continuation_leaves_behind_stops_looking_live():
-    """The owner a handoff moves AWAY from must not freeze mid-run.
-
-    A handoff switches the owner pointer and touches nothing else, so the card it leaves behind froze
-    at that instant: footer still spinning 执行中, the cumulative tool tally stale, and the decided
-    approval block still sitting on it. It never receives a terminal render either — not even when
-    the turn finishes — so on this exact flow it still read ⏳ / 执行中 / 已选择 long after
-    message.completed, and a reader scrolling the thread cannot tell which card owns the answer.
-    """
+@pytest.mark.parametrize('terminal', [False, True])
+async def test_confirmed_handoff_freezes_old_card_without_claiming_turn_success(terminal):
     client = Client()
     app = create_app(client, card_config={"flush_interval_ms": 0})
     async with TestClient(TestServer(app)) as http:
-        await post(http, "message.started", 0)
-        await post(http, "answer.delta", 1, {"text": "BEFORE_CHOICE"})
-        await interact(http, 3, "question_one", kind="approval")
-        await post(http, "answer.delta", 5, {"text": "AFTER_CHOICE"})
-        await post(http, "message.completed", 7, {"answer": "FINAL_ANSWER"})
-        await asyncio.sleep(.05)
-
-        left_behind = client.sent[0][0]
-        assert app[FEISHU_MESSAGE_IDS_KEY]["turn_fixture"] != left_behind, "the owner must have moved"
-
-        updates = [card for mid, card in client.updated if mid == left_behind]
-        assert updates, "the card left behind was never closed"
-        final = updates[-1]
-        header = final.get("header") if isinstance(final.get("header"), dict) else {}
-        title = (header.get("title") or {}).get("content") or ""
-        subtitle = (header.get("subtitle") or {}).get("content") or ""
-        text = str(final)
-
-        assert "⏳" not in title, "a handed-off card must not still look like it is working"
-        assert "✅" in title
-        assert "执行中" not in text, "the footer must not still be spinning"
-        assert "已选择" not in text, "the decided approval block belongs to the approval card now"
-        assert "后续内容见下方新卡" in subtitle, "the reader has to be told where the turn went"
+        await post(http, 'message.started', 0)
+        await post(http, 'answer.delta', 1, {'text':'BEFORE_SELECTION'})
+        await post(http, 'tool.updated', 2, {'tool_id':'live', 'name':'clarify', 'status':'running'})
+        await post(http, 'subagent.updated', 3, {'child_id':'worker', 'name':'Research', 'status':'running'})
+        await interact(http, 4, 'question_one')
+        old_id = app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']
+        await post(http, 'message.failed' if terminal else 'answer.delta', 6,
+                   {'error':'AFTER_SELECTION_FAILURE'} if terminal else {'text':'AFTER_SELECTION'})
+        await asyncio.sleep(.03)
+        retired = next(card for mid, card in reversed(client.updated) if mid == old_id)
+        assert retired['header']['template'] == 'blue'
+        assert '本段已转入续答' in retired['header']['subtitle']['content']
+        footer = next(e for e in retired['body']['elements'] if e.get('element_id') == 'footer')
+        assert '下方新卡' in footer['content'] and '已完成' not in footer['content']
+        assert 'BEFORE_SELECTION' in str(retired) and 'AFTER_SELECTION' not in str(retired)
+        assert '已选择' in str(retired) and 'Choose fixture' in str(retired)
+        assert '执行中' not in str(retired) and '已中断' not in str(retired)
+        assert retired['config']['streaming_mode'] is False
+        session = app[SESSIONS_KEY]['turn_fixture']
+        assert session.tools['live'].status == 'running'
+        assert 'display_handoff' not in str(session.timeline)
+        if terminal:
+            assert session.status == 'failed'
+        else:
+            assert session.status not in {'completed', 'failed'}
+        assert app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture'] != old_id
 
 
 @pytest.mark.asyncio
-async def test_a_failed_continuation_leaves_the_old_card_alone():
-    """Only a CONFIRMED handoff closes the card it left behind.
-
-    When the new card is not delivered the old owner keeps the whole turn, so closing it there would
-    strand the reader with a card that says the turn moved on when it did not.
-    """
-    client = Client()
-    app = create_app(client, card_config={"flush_interval_ms": 0})
+async def test_failed_predecessor_patch_keeps_new_owner_and_terminal_delivery():
+    from hermes_feishu_card.server import DIAGNOSTICS_KEY
+    class FailingOldUpdate(Client):
+        async def update_card_message(self, mid, card):
+            if '本段已转入续答' in card.get('header', {}).get('subtitle', {}).get('content', ''):
+                raise RuntimeError('fixture old message unavailable')
+            return await super().update_card_message(mid, card)
+    client = FailingOldUpdate()
+    app = create_app(client, card_config={'flush_interval_ms':0})
     async with TestClient(TestServer(app)) as http:
-        await post(http, "message.started", 0)
-        await post(http, "answer.delta", 1, {"text": "BEFORE_CHOICE"})
-        await interact(http, 3, "question_one", kind="approval")
-        client.fail = True
-        await post(http, "answer.delta", 5, {"text": "AFTER_CHOICE"})
-        await asyncio.sleep(.02)
+        await post(http, 'message.started', 0)
+        await interact(http, 1, 'question_one')
+        await post(http, 'answer.delta', 3, {'text':'NEW_OWNER_CONTENT'})
+        owner = app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']
+        await post(http, 'message.completed', 4, {'answer':'FINAL_NEW_OWNER'})
+        assert owner == 'om_segment_3'
+        assert 'FINAL_NEW_OWNER' in str(client.updated[-1][1])
+        assert app[DIAGNOSTICS_KEY]['last_continuation_predecessor'] == 'update_failed'
 
-        first = client.sent[0][0]
-        assert app[FEISHU_MESSAGE_IDS_KEY]["turn_fixture"] == first, "the owner must not move"
-        assert not any(
-            mid == first and "后续内容见下方新卡" in str(card)
-            for mid, card in client.updated
-        ), "a failed handoff must not close the card it did not replace"
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('start_first', [True, False])
+@pytest.mark.parametrize('mode', ['text', 'callback'])
+async def test_resolved_receipts_keep_dialect_choices_and_live_turn(start_first, mode):
+    client = Client()
+    app = create_app(client, card_config={'interaction_mode':mode, 'flush_interval_ms':0})
+    async with TestClient(TestServer(app)) as http:
+        if start_first:
+            await post(http, 'message.started', 0)
+            await post(http, 'tool.updated', 1, {'tool_id':'live', 'name':'clarify', 'status':'running'})
+        receipt_ids = []
+        for seq in (2, 4):
+            await interact(http, seq, f'question_{seq}')
+            receipt_ids.append(app[SESSIONS_KEY]['turn_fixture'].active_interaction.feishu_message_id)
+            await asyncio.sleep(.02)
+            for mid in receipt_ids:
+                card = next(c for m, c in reversed(client.updated) if m == mid)
+                if mode == 'text':
+                    assert card['schema'] == '2.0'
+                    assert '交互结果已记录' in str(card)
+                else:
+                    assert card.get('schema') is None
+                    assert 'interaction.select' not in str(card)
+                assert not client.cross_dialect
+                assert 'Choose fixture' in str(card) and '已选择' in str(card)
+                assert '执行中' not in str(card) and '已中断' not in str(card)
+                assert '本轮回复结束' not in str(card)
+            assert app[SESSIONS_KEY]['turn_fixture'].status not in {'completed','failed'}
+        await post(http, 'message.completed', 6, {'answer':'FINAL_AFTER_TWO'})
+        assert 'FINAL_AFTER_TWO' in str(client.updated[-1][1])

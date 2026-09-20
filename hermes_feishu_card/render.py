@@ -122,6 +122,8 @@ def render_card(
     hide_completed_tool_activity: bool = False,
     stream_thinking_to_body: bool = True,
     hide_successful_tool_activity: bool = False,
+    timeline_order: str = "chronological",
+    timeline_tools_per_reasoning: int = 2,
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -143,6 +145,8 @@ def render_card(
         hide_completed_tool_activity=hide_completed_tool_activity,
         stream_thinking_to_body=stream_thinking_to_body,
         hide_successful_tool_activity=hide_successful_tool_activity,
+        timeline_order=timeline_order,
+        timeline_tools_per_reasoning=timeline_tools_per_reasoning,
     ).card
 
 
@@ -166,6 +170,8 @@ def render_card_result(
     hide_completed_tool_activity: bool = False,
     stream_thinking_to_body: bool = True,
     hide_successful_tool_activity: bool = False,
+    timeline_order: str = "chronological",
+    timeline_tools_per_reasoning: int = 2,
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(
         session, stream_thinking_to_body=stream_thinking_to_body
@@ -194,6 +200,8 @@ def render_card_result(
         hide_completed_tool_activity=hide_completed_tool_activity,
         stream_thinking_to_body=stream_thinking_to_body,
         hide_successful_tool_activity=hide_successful_tool_activity,
+        timeline_order=timeline_order,
+        timeline_tools_per_reasoning=timeline_tools_per_reasoning,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -240,6 +248,8 @@ def _render_card_unchecked(
     hide_completed_tool_activity: bool = False,
     stream_thinking_to_body: bool = True,
     hide_successful_tool_activity: bool = False,
+    timeline_order: str = "chronological",
+    timeline_tools_per_reasoning: int = 2,
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -362,6 +372,8 @@ def _render_card_unchecked(
             max_items=max_timeline_items,
             max_reasoning_chars=max_reasoning_chars,
             max_tool_result_chars=max_tool_result_chars,
+            timeline_order=timeline_order,
+            tools_per_reasoning=timeline_tools_per_reasoning,
             text_sizes=text_sizes,
             used_text_size_roles=used_text_size_roles,
             reasoning_format=reasoning_format,
@@ -1683,7 +1695,7 @@ def _name_tag(name: str) -> str:
 
 
 def _tool_is_running(tool: ToolState) -> bool:
-    return str(tool.status or "").strip().lower() not in TERMINAL_TOOL_STATUSES
+    return str(tool.status or "").strip().lower() not in TERMINAL_TOOL_STATUSES | {"display_handoff", "display_receipt"}
 
 
 def _render_tool_activity_elements(
@@ -1940,6 +1952,8 @@ def _tool_activity_row(
 
 def _tool_terminal_pill(tool: ToolState) -> tuple[str, str]:
     status = str(tool.status or "").strip().lower()
+    if status in {"display_handoff", "display_receipt"}:
+        return ("已转入续答" if status == "display_handoff" else "已记录"), "neutral"
     if status in {"failed", "cancelled", "canceled"}:
         return _FAILED_TOOL_PILL
     return _FINISHED_TOOL_PILL
@@ -1959,6 +1973,8 @@ def _render_timeline_elements(
     used_text_size_roles: set[str] | None = None,
     reasoning_format: str = "panel",
     live_thinking: str = "",
+    timeline_order: str = "chronological",
+    tools_per_reasoning: int = 2,
 ) -> list[Dict[str, Any]]:
     if not getattr(session, "timeline", None):
         return []
@@ -1980,9 +1996,14 @@ def _render_timeline_elements(
     # that ran twenty tools cannot consume the whole budget and push the earlier blocks (and their
     # thinking) out of the panel.
     entries = _keep_recent_tools_after_each_reasoning(
-        all_entries, per_reasoning=_TOOL_ACTIVITY_WINDOW
+        all_entries, per_reasoning=tools_per_reasoning
     )
     entries = _select_timeline_entries(entries, max_items=max_items)
+    # Fork contract: upstream v4.6.5 parameterises this same rule as
+    # `card.timeline_tools_per_reasoning` and keeps its own `_limit_tools_per_reasoning`; the fork
+    # honours that knob but keeps this window, which was tuned to the user's running-row rule (a
+    # running row is never dropped, and it keeps the row that led into it). Setting the knob to 0
+    # reproduces upstream's behaviour exactly.
     folded = max(0, len(all_entries) - len(entries))
     panel_elements: list[Dict[str, Any]] = []
     reasoning_elements: list[Dict[str, Any]] = []
@@ -1992,10 +2013,15 @@ def _render_timeline_elements(
     # easier to follow than one you scan upward, and it matches the body's reasoning entries, which
     # are chronological for the same reason (「正文的思考应该正序」).
     #
-    # Maintainer note (contract difference): upstream v4.6.4 keeps the panel NEWEST-FIRST
-    # (`reversed(list(enumerate(entries)))`). This fork's change came later (09-18 23:33 vs their
-    # 09-18 01:28) and was an explicit user request, so the panel stays chronological here.
-    panel_order = list(enumerate(entries))
+    # Maintainer note (contract change): the reasoning entries that render into the CARD BODY are the
+    # exception, and they keep chronological order. Body thinking is prose the reader follows
+    # FORWARD ("思考 1", then "思考 2"), not a log they scan for the latest state — newest-first made
+    # the body read bottom-up, which is what the user reported ("正文的思考应该正序"). `index` still
+    # carries each entry's original position, so element ids are unchanged and identical entries are
+    # still selected; only the order they are written in differs per surface.
+    panel_order = [(i, e) for i, e in reversed(list(enumerate(entries)))]
+    if timeline_order == "chronological":
+        panel_order.reverse()
     if reasoning_format == "code":
         # "code" puts reasoning in the body (see the target_elements split below) and tools in the
         # panel. Both surfaces are chronological now, so the two groups keep their original order.
@@ -2114,8 +2140,7 @@ def _render_timeline_elements(
         # that stands for them belongs at the BOTTOM, below the oldest entry still shown. Emitting it
         # first (as it did in chronological order) would put a "here is where the history was cut"
         # marker above the newest work, which reads as if the cut happened at the top.
-        panel_elements.extend(
-            _timeline_markdown_elements(
+        folded_elements = _timeline_markdown_elements(
                 f"> 已折叠 {folded} 条早期思考/工具记录",
                 "auxiliary_timeline_folded",
                 text_size=_role_text_size(
@@ -2125,7 +2150,10 @@ def _render_timeline_elements(
                     used_roles=used_text_size_roles,
                 ),
             )
-        )
+        if timeline_order == "chronological":
+            panel_elements[0:0] = folded_elements
+        else:
+            panel_elements.extend(folded_elements)
     if panel_elements:
         # The panel is named for thinking and tool work. A timeline holding only notices (a deferred
         # compression hint, a skill-loading note) is neither, and folding those into it produced
@@ -2253,6 +2281,10 @@ def _render_tool_timeline_row(
     elif normalized_status in {"cancelled", "canceled", "已取消", "取消"}:
         color = "grey"
         headline = f"⊘ **{safe_title}**{meta_suffix} · 已取消"
+    elif normalized_status in {"display_handoff", "display_receipt"}:
+        color = "grey"
+        label = "已转入续答" if normalized_status == "display_handoff" else "已记录"
+        headline = f"↪ **{safe_title}**{meta_suffix} · {label}"
     elif normalized_status in {"queued", "waiting", "排队中", "等待中"}:
         color = "grey"
         headline = f"○ **{safe_title}**{meta_suffix} · 等待中"
@@ -2278,6 +2310,9 @@ def _render_subagent_timeline_row(title: str, status: str, detail: str) -> str:
         color, headline = "grey", f"⊘ **{label}** · 已取消"
     elif normalized_status == "interrupted":
         color, headline = "grey", f"⊘ **{label}** · 已中断"
+    elif normalized_status in {"display_handoff", "display_receipt"}:
+        state_label = "已转入续答" if normalized_status == "display_handoff" else "已记录"
+        color, headline = "grey", f"↪ **{label}** · {state_label}"
     elif normalized_status in {"queued", "waiting"}:
         color, headline = "grey", f"○ **{label}** · 等待中"
     else:
@@ -2352,20 +2387,30 @@ def _keep_recent_tools_after_each_reasoning(entries: list[Any], *, per_reasoning
     keep: set[int] = set()
     pending: list[int] = []
 
+    def _finished_ok(entry: Any) -> bool:
+        """A tool row that SUCCEEDED. Only these compete for the per-block window."""
+        return str(getattr(entry, "status", "")).strip().lower() in {
+            "completed", "已完成", "完成", "成功",
+        }
+
     def flush() -> None:
         if pending:
-            keep.update(pending[-per_reasoning:])
-            # Pin anything still RUNNING, plus the row right before it. A tool that has not finished
-            # is not stale work the window may drop — it IS the work in progress, and the reader
-            # scans the panel for exactly that row. The user hit this on a turn where #25 was still
-            # 执行中 while the panel had already scrolled past it: 「在下方的思考过程的工具里面，看
-            # 不到『执行中』或『执行中』前面的内容，像这里看不到 24，25」. The per-block window is
-            # for COMPLETED rows; a running one is never old enough to drop.
+            # The window counts SUCCESSES, matching upstream's `_limit_tools_per_reasoning`: a block
+            # that ran eight successful tools keeps its last two. Counting every row instead would let
+            # one long failure streak push the successes out of their own block's window.
+            successes = [index for index in pending if _finished_ok(entries[index])]
+            keep.update(successes[-per_reasoning:])
+            # Everything that did NOT finish successfully is kept outright: a failure is the record of
+            # what went wrong (upstream's rule, and the reason their release note calls them out), and
+            # a running row is not stale work — it IS the work in progress.
+            keep.update(index for index in pending if not _finished_ok(entries[index]))
+            # Pin the row right BEFORE a running one. The user asked for exactly this
+            # (「我的意思是说 保留执行中和执行中前面的一条」): the row that led into the live step is what
+            # the reader is looking at. It matters when that predecessor is an old success, which the
+            # per-block window would otherwise drop — e.g. #25 执行中 with #24 as its predecessor.
             for position, index in enumerate(pending):
-                if str(getattr(entries[index], "status", "")) == "running":
-                    keep.add(index)
-                    if position > 0:
-                        keep.add(pending[position - 1])
+                if str(getattr(entries[index], "status", "")).strip().lower() == "running" and position > 0:
+                    keep.add(pending[position - 1])
             del pending[:]
 
     for index, entry in enumerate(entries):
@@ -2379,6 +2424,22 @@ def _keep_recent_tools_after_each_reasoning(entries: list[Any], *, per_reasoning
             keep.add(index)
     flush()
     return [entry for index, entry in enumerate(entries) if index in keep]
+
+
+def _limit_tools_per_reasoning(entries: list[Any], limit: int) -> list[Any]:
+    """Opt-in display pruning; keep failures/running work and all stored history."""
+    if type(limit) is not int or limit <= 0:
+        return entries
+    omitted = set()
+    group = []
+    for index, entry in enumerate(entries):
+        if entry.kind == "reasoning":
+            omitted.update(group[:-limit])
+            group = []
+        elif entry.kind == "tool" and str(entry.status).strip().lower() in {"completed", "已完成", "完成", "成功"}:
+            group.append(index)
+    omitted.update(group[:-limit])
+    return [entry for index, entry in enumerate(entries) if index not in omitted]
 
 
 def _select_timeline_entries(entries: list[Any], *, max_items: int) -> list[Any]:

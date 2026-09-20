@@ -47,6 +47,14 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "hide_completed_tool_activity": True,
         "reasoning_format": "panel",
         "timeline_expanded": False,
+        # Defaults differ from upstream on purpose (fork contract). Upstream v4.6.5 added both knobs
+        # but defaults them to the OLD behaviour — ``newest_first`` and ``0`` (no per-block window) —
+        # and told users to opt in. The user's stance is the opposite: the convenient behaviour has to
+        # be what a reader gets without configuring anything (「要争默认值。使用者便利第一位。不应该给
+        # 使用者增加麻烦」). So the panel reads chronologically and every thinking block keeps its last
+        # two tool rows by default. An explicit value in a config file still wins over both.
+        "timeline_order": "chronological",
+        "timeline_tools_per_reasoning": 2,
         "max_timeline_items": 12,
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
@@ -455,6 +463,15 @@ def _normalize_card_config(value: object, *, path: str) -> None:
         if not isinstance(raw_format, str) or raw_format.strip().lower() not in {"panel", "code"}:
             raise ValueError(f"{path}.reasoning_format must be panel or code")
         value["reasoning_format"] = raw_format.strip().lower()
+    if "timeline_order" in value:
+        raw_order = value["timeline_order"]
+        if not isinstance(raw_order, str) or raw_order.strip().lower() not in {"newest_first", "chronological"}:
+            raise ValueError(f"{path}.timeline_order must be newest_first or chronological")
+        value["timeline_order"] = raw_order.strip().lower()
+    if "timeline_tools_per_reasoning" in value:
+        limit = value["timeline_tools_per_reasoning"]
+        if type(limit) is not int or not 0 <= limit <= 100:
+            raise ValueError(f"{path}.timeline_tools_per_reasoning must be an integer from 0 to 100")
     if "mentions_in_cards" in value and value["mentions_in_cards"] is not None:
         value["mentions_in_cards"] = _normalize_boolean(
             value["mentions_in_cards"], f"{path}.mentions_in_cards"
