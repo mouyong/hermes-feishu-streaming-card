@@ -46,10 +46,14 @@ async def test_http_terminal_tool_visibility_preserves_answer_and_single_card(te
         assert len(fake.sent) == 1
         card = fake.updated[-1][1]
         assert 'KEEP_ANSWER' in str(card)
-        # Contract difference from upstream, on purpose: a FAILED turn keeps its tool rows even with
-        # the switch on, because they carry the 已中断 pill — WHERE the run stopped, the one thing a
-        # reader opens a failed card for. Upstream hides them for `failed` too.
-        expect_rows = (not hide) or terminal == 'message.failed'
+        # Contract change (v4.6.6): with the switch on, a finished turn hides its SUCCESSFUL rows on a
+        # completed AND a failed terminal — the fixture row above is `completed`, so it goes in both
+        # cases. v4.6.6 moved this filtering into the renderer, which keeps every NON-successful row
+        # (中断/失败/取消) — that is the part the fork insists on, because those carry the 已中断 pill a
+        # reader opens a failed card for. It is pinned by
+        # test_terminal_compaction_preserves_unsuccessful_tool_evidence (fork) and
+        # test_terminal_compaction_keeps_old_interrupted_body_tools_in_the_panel (upstream).
+        expect_rows = not hide
         assert ('tool_activity_' in str(card)) is expect_rows
         assert '工具 #1' in str(card)
         if terminal == 'message.failed':
