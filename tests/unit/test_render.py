@@ -3027,3 +3027,53 @@ def test_a_longer_option_list_wraps_into_more_compact_rows():
     rows = [element for element in card["elements"] if element.get("tag") == "column_set"]
     assert [len(row["columns"]) for row in rows] == [4, 2]
     assert len(interaction_buttons(card)) == 6
+
+
+def _timeline_entry(kind, *, status="completed", tool_id="", title=""):
+    from hermes_feishu_card.card_timeline import TimelineEntry
+
+    return TimelineEntry(
+        kind=kind, title=title or kind, status=status, tool_id=tool_id
+    )
+
+
+def test_a_running_tool_row_survives_the_per_reasoning_window():
+    """A tool that is STILL EXECUTING is never dropped by the per-block window.
+
+    Reproduces the panel the user was looking at: #25 was still 执行中 while the panel had already
+    scrolled past it — 「在下方的思考过程的工具里面，看不到『执行中』或『执行中』前面的内容，像这里
+    看不到 24，25」. The per-block window keeps a block's last two tools; the running row and the row
+    right before it must be pinned on top of that, because the reader scans for exactly that row.
+    """
+    from hermes_feishu_card.render import _keep_recent_tools_after_each_reasoning
+
+    entries = [_timeline_entry("reasoning")]
+    entries.append(_timeline_entry("tool", tool_id="#24"))
+    entries.append(_timeline_entry("tool", tool_id="#25", status="running"))
+    for number in range(26, 31):  # five more completed rows: the window alone would keep only #29/#30
+        entries.append(_timeline_entry("tool", tool_id=f"#{number}"))
+
+    kept = _keep_recent_tools_after_each_reasoning(entries, per_reasoning=2)
+    ids = [entry.tool_id for entry in kept if entry.kind == "tool"]
+
+    assert "#25" in ids, ids  # the running row must not be windowed away
+    assert "#24" in ids, ids  # nor the row immediately before it
+    assert "#29" in ids and "#30" in ids, ids  # the normal window still applies
+
+
+def test_the_panel_keeps_a_running_row_even_outside_the_size_window():
+    """The panel's size window also pins running rows (and the row before each)."""
+    from hermes_feishu_card.render import _select_timeline_entries
+
+    entries = [_timeline_entry("reasoning")]
+    entries.append(_timeline_entry("tool", tool_id="#24"))
+    entries.append(_timeline_entry("tool", tool_id="#25", status="running"))
+    for number in range(26, 46):  # 20 more rows: a 12-item window no longer reaches #25
+        entries.append(_timeline_entry("tool", tool_id=f"#{number}"))
+
+    kept = _select_timeline_entries(entries, max_items=12)
+    ids = [entry.tool_id for entry in kept if entry.kind == "tool"]
+
+    assert "#25" in ids, ids
+    assert "#24" in ids, ids
+    assert "#45" in ids, ids  # the newest rows are still there

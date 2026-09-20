@@ -2355,6 +2355,17 @@ def _keep_recent_tools_after_each_reasoning(entries: list[Any], *, per_reasoning
     def flush() -> None:
         if pending:
             keep.update(pending[-per_reasoning:])
+            # Pin anything still RUNNING, plus the row right before it. A tool that has not finished
+            # is not stale work the window may drop — it IS the work in progress, and the reader
+            # scans the panel for exactly that row. The user hit this on a turn where #25 was still
+            # 执行中 while the panel had already scrolled past it: 「在下方的思考过程的工具里面，看
+            # 不到『执行中』或『执行中』前面的内容，像这里看不到 24，25」. The per-block window is
+            # for COMPLETED rows; a running one is never old enough to drop.
+            for position, index in enumerate(pending):
+                if str(getattr(entries[index], "status", "")) == "running":
+                    keep.add(index)
+                    if position > 0:
+                        keep.add(pending[position - 1])
             del pending[:]
 
     for index, entry in enumerate(entries):
@@ -2374,25 +2385,37 @@ def _select_timeline_entries(entries: list[Any], *, max_items: int) -> list[Any]
     if max_items <= 0 or len(entries) <= max_items:
         return list(entries)
 
+    # A running row is never old: pin it and the row before it, BEFORE the size logic below, so that
+    # neither the window nor the "swap the oldest slot for the latest reasoning" rule can drop one.
+    # The reader scans the panel for the work in progress; the sidecar keeps long tool rows running
+    # for minutes, so #25 was still 执行中 while the panel had already scrolled past it
+    # (「看不到『执行中』或『执行中』前面的内容，像这里看不到 24，25」).
+    pinned: set[int] = set()
+    for index, entry in enumerate(entries):
+        if str(getattr(entry, "status", "")) == "running":
+            pinned.add(index)
+            if index > 0:
+                pinned.add(index - 1)
+
     selected_indexes = list(range(len(entries) - max_items, len(entries)))
-    if max_items <= 1:
-        return [entries[index] for index in selected_indexes]
-    if any(entries[index].kind == "reasoning" for index in selected_indexes):
-        return [entries[index] for index in selected_indexes]
-
-    latest_reasoning_index = next(
-        (
-            index
-            for index in range(len(entries) - 1, -1, -1)
-            if entries[index].kind == "reasoning"
-        ),
-        None,
-    )
-    if latest_reasoning_index is None:
-        return [entries[index] for index in selected_indexes]
-
-    selected_indexes = [latest_reasoning_index] + selected_indexes[1:]
-    selected_indexes = sorted(dict.fromkeys(selected_indexes))
+    if max_items > 1 and not any(
+        entries[index].kind == "reasoning" for index in selected_indexes
+    ):
+        latest_reasoning_index = next(
+            (
+                index
+                for index in range(len(entries) - 1, -1, -1)
+                if entries[index].kind == "reasoning"
+            ),
+            None,
+        )
+        if latest_reasoning_index is not None:
+            selected_indexes = [latest_reasoning_index] + selected_indexes[1:]
+    if pinned:
+        # Union AFTER the swap: the swap drops the oldest slot, which is exactly where a pinned
+        # running row can sit (the first assertion in
+        # test_the_panel_keeps_a_running_row_even_outside_the_size_window caught this).
+        selected_indexes = sorted(set(selected_indexes) | pinned)
     return [entries[index] for index in selected_indexes]
 
 
