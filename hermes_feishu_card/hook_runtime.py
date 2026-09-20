@@ -9990,8 +9990,14 @@ def _transient_notice_recall_seconds(content: Any) -> Optional[float]:
     # The adapter also sends answers and important queue/error acknowledgements.
     # An hourglass alone is not evidence that a message is disposable status.
     if text.startswith(STATUS_NOTICE_PREFIX):
+        # ⏳ Working is deliberately NOT here. It is the one ⏳ line the core keeps UPDATING in
+        # place (`HERMES_AGENT_NOTIFY_INTERVAL`, default 180s, edits `_heartbeat_msg_id`), so
+        # withdrawing it broke the edit: the next cycle found a deleted message, the edit failed,
+        # and the core fell back to sending a FRESH one — one heartbeat turned into "new message +
+        # withdrawal" every cycle, which is what flooded the thread («working background 等等。这些
+        # 心跳感觉太多了»). Left alone, the heartbeat is a single quiet in-place update; the other
+        # five ⏳ shapes are genuinely one-shot and keep their 15s.
         status_patterns = (
-            r"⏳ Working — \d+ min(?: — [^\r\n]+)?",
             r"⏳ (?:Compressing context|Waiting for approval|tool execution timed out; retrying)(?:\.\.\.)?",
             r"⏳ Retrying in \d+(?:\.\d+)?s \(attempt \d+/\d+\)(?:\.\.\.)?",
             r"⏳ loading [^\r\n]+ into memory — \d+(?:\.\d+)?%[^\r\n]*",

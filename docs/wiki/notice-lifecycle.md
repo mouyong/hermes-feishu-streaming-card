@@ -5,7 +5,11 @@ V4.6.x 从 [PR #331](https://github.com/baileyh8/hermes-feishu-streaming-card/pu
 
 ## 用户可见行为
 
-- 已发布的 Working、Redirect、Interrupt、Steer 临时提示继续使用原有 15 秒策略。
+- Redirect、Interrupt、Steer 临时提示，以及一次性的 `⏳` 状态行（Compressing context、
+  Waiting for approval、Retrying in、loading … into memory、waiting on）继续使用原有 15 秒策略。
+- `⏳ Working — N min` **心跳不撤回**。它是 core 唯一会**就地编辑**的 `⏳` 行
+  （`HERMES_AGENT_NOTIFY_INTERVAL`，默认 180 秒），撤回它会让下一次编辑找不到消息而改发新行 ——
+  一次心跳就变成「新消息 + 撤回」，反而把话题刷满。不撤它就是一条安静的就地更新。
 - HFC 专用通知生成路径发送的 `♻️ Gateway online — Hermes is back and ready.`，
   在成功投递并带有显式生成来源时，可以登记为临时重启通知。这个新增路径没有 15 秒倒计时。
   泛化 `adapter.send`、原生 home/重启/关机文本无法证明生成来源时继续保留；

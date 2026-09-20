@@ -147,10 +147,24 @@ async def test_registration_failure_never_changes_successful_plain_notice_send(r
     assert result is sent
 
 
-async def test_existing_working_notice_keeps_its_fifteen_second_timer(runtime_route):
-    assert await runtime._hfc_recall_plain_text_status_notice(
+async def test_the_working_heartbeat_is_not_withdrawn_but_one_shot_status_still_is(runtime_route):
+    """The heartbeat keeps its message; a one-shot status line still gets its 15s.
+
+    Maintainer note (contract change): this test used to pin a 15s timer on the heartbeat itself.
+    That timer is what flooded the thread: the core keeps EDITING one heartbeat line in place, so
+    withdrawing it meant the next cycle found the message gone, the edit failed, and the core sent a
+    fresh line — one heartbeat became "new message + withdrawal" every
+    ``HERMES_AGENT_NOTIFY_INTERVAL`` («working background 等等。这些心跳感觉太多了»).
+    """
+    assert not await runtime._hfc_recall_plain_text_status_notice(
         "oc_fixture", "⏳ Working — 12 min — receiving stream response", None,
         SimpleNamespace(success=True, message_id="om_working"),
+    )
+    assert runtime_route == []
+
+    assert await runtime._hfc_recall_plain_text_status_notice(
+        "oc_fixture", "⏳ Retrying in 3.0s (attempt 2/3)", None,
+        SimpleNamespace(success=True, message_id="om_retrying"),
     )
     payload = runtime_route[0][1]
     assert payload["delay_seconds"] == 15
