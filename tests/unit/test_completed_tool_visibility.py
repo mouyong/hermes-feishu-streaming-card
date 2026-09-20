@@ -1,5 +1,6 @@
 import pytest
 
+from hermes_feishu_card import render
 from hermes_feishu_card.config import DEFAULT_CONFIG
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.render import render_card
@@ -45,8 +46,15 @@ def test_terminal_tool_visibility_changes_only_content_tool_rows(status, reasoni
     assert 'fixture-tool' in session.tools
 
 
-def test_switch_preserves_live_progress_and_default():
+def test_switch_preserves_live_progress_and_default(monkeypatch):
     session = session_with_tool()
+    # The footer shows a spinner whose FRAME is a function of the wall clock
+    # (`_SPINNER_FRAMES[int(_time.time() * 8) % 10]`), so two independent render_card calls can
+    # disagree on that one character and nothing else — which they did, intermittently, on the
+    # whole-card comparisons below. Pin the frame rather than the clock (freezing `_time` would also
+    # skew every elapsed-time reading) and rather than weakening the comparisons: the two cards must
+    # still match in every other respect, which is the point.
+    monkeypatch.setattr(render, "_spinner_frame", lambda: "⠋")
     # Default True in the CONFIG, against upstream's False — the user's call: a finished card reads as
     # answer + footer, and a deployment that wants the rows back sets it false. The render_card
     # parameter still defaults to False; the server passes the config value in explicitly.

@@ -5193,6 +5193,29 @@ def _hfc_content_notice_id(kind: str, content: str) -> str:
 
 _HFC_GATEWAY_ONLINE_TEXT = "♻️ Gateway online — Hermes is back and ready."
 
+# The core still emits the restart-completion line with a BARE U+267B, and it reaches this wrapper only
+# on its way to the chat/thread that REQUESTED the restart. Feishu renders that bare glyph monochrome,
+# while the variation-selector form below is coloured — so the requester got a black ♻ in the thread
+# and a coloured ♻️ in Home (「希望话题里面的线程收到的也是彩色的」). Both spellings are listed because
+# the core has shipped each of them.
+_CORE_RESTART_ONLINE_TEXTS = frozenset({
+    "♻ Gateway restarted successfully. Your session continues.",
+    "♻️ Gateway restarted successfully. Your session continues.",
+})
+
+
+def _hfc_restart_notice_rewrite(content: Any) -> str | None:
+    """Return ``_HFC_GATEWAY_ONLINE_TEXT`` for a core restart-completion line, else ``None``.
+
+    Scope is deliberately narrow: only the core's legacy wording is rewritten, so the home-channel
+    line (already `_HFC_GATEWAY_ONLINE_TEXT`) keeps taking its own path through
+    ``_hfc_send_plain_notice`` and its existing fallback contract.
+    """
+    text = str(content or "").strip()
+    if text in _CORE_RESTART_ONLINE_TEXTS:
+        return _HFC_GATEWAY_ONLINE_TEXT
+    return None
+
 
 def _hfc_notice_plain_text(notice: Any) -> str | None:
     """Wording for a notice the gateway should deliver as PLAIN TEXT instead of a card.
@@ -6510,6 +6533,27 @@ async def _hfc_send_with_native_command_result_card(
     metadata: dict[str, Any] | None = None,
 ) -> Any:
     original = getattr(type(self), "_hfc_original_send", None)
+    # The core's restart-completion line reaches this wrapper only on its way to the chat/thread that
+    # REQUESTED the restart, and it is the one send that must not keep the core's monochrome ♻ (see
+    # `_CORE_RESTART_ONLINE_TEXTS`). Handled in front of the handoff/card branches so a single place
+    # owns both the wording and the withdrawal — `_hfc_recall_plain_text_status_notice` retires the
+    # ⚠️ warning in front of it and arms this line's own 15s deadline.
+    #
+    # Doing it HERE rather than in the notice classifier matters: the classifier only runs when the
+    # card policy ACCEPTS the chat. When it declines, the wrapper used to hand the core's text
+    # straight to ``original`` — bare U+267B, monochrome, and on no recall path at all. Placed here,
+    # every path that reaches this wrapper gets the coloured line and its withdrawal.
+    restart_online = _hfc_restart_notice_rewrite(content)
+    if restart_online is not None and callable(original):
+        result = await original(
+            self, chat_id, restart_online, reply_to=reply_to, metadata=metadata,
+        )
+        await _hfc_recall_plain_text_status_notice(
+            chat_id, restart_online, metadata, result,
+            reply_to=reply_to,
+            generated_restart_notice=True,
+        )
+        return result
     handoff_context = _native_handoff_for_send(self, chat_id, content, metadata)
     if handoff_context is not None and callable(original):
         descriptor = handoff_context["descriptor"]
